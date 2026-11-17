@@ -1,0 +1,41 @@
+<aside class="project-editor" aria-label="项目管理" data-project-editor hidden inert>
+  <div class="panel editor-panel" data-editor-panel>
+    {% for project in projects %}
+      {% set edit_open = edit_issue and edit_issue.slug == project.slug %}
+      {% set fields = edit_issue.fields if edit_open else project %}
+      <section id="manage-{{ project.slug }}" aria-labelledby="manage-name-{{ project.slug }}" data-project-panel hidden>
+        <div class="section-heading editor-heading">
+          <h2 id="manage-name-{{ project.slug }}" data-editor-project>{{ project.name }}</h2>
+          <button type="button" class="secondary" data-close-editor>收起</button>
+        </div>
+        <h3>修改配置</h3>
+        <form method="post" action="{{ url_for('save_project', _anchor='project-' ~ project.slug) }}" data-edit-form>
+          <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="slug" value="{{ project.slug }}">
+          <div class="edit-grid">
+            <label>项目名称<input name="name" value="{{ fields.name }}" maxlength="60" required></label>
+            <label>网页监听地址<select name="target_host">{{ target_host_options(fields.target_host or project.target_host) }}</select></label>
+            <label>网页端口<input type="number" name="target_port" min="1" max="65535" value="{{ fields.target_port }}" required></label>
+            <label>NATMap 本地端口（选填）<input type="number" name="bind_port" min="1" max="65535" value="{{ fields.bind_port if fields.bind_port is not none else '' }}" placeholder="留空自动分配"></label>
+            <label>本地网页协议<select name="scheme">{{ scheme_options(fields.scheme) }}</select></label>
+          </div>
+          <p class="form-error" data-edit-error role="alert"{% if not edit_open %} hidden{% endif %}>{{ edit_issue.message if edit_open else '' }}</p>
+          <button type="submit" class="primary">保存配置</button>
+        </form>
+
+        <section class="project-more" aria-labelledby="manage-logs-{{ project.slug }}">
+          <h3 id="manage-logs-{{ project.slug }}">运行日志</h3>
+          {% if project.entry != ('https://' ~ project.slug ~ '.pages.dev') %}
+            <p class="hint project-detail">申请的子域名为 {{ project.slug }}.pages.dev</p>
+          {% endif %}
+          <p class="configuration-note" data-changes-pending role="status"{% if not project.changes_pending or project.phase == '正在重启' %} hidden{% endif %}>本地地址、端口或协议将在下次运行时生效。</p>
+          <p class="connection project-detail" data-detail{% if not project.detail %} hidden{% endif %}>{{ project.detail }}</p>
+          <pre class="log" aria-label="运行日志" tabindex="0" data-log>{{ project.logs or '暂无日志。' }}</pre>
+          <form method="post" action="{{ url_for('change', action='delete') }}" class="actions editor-delete">
+            <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="slug" value="{{ project.slug }}">
+            <button type="submit" class="remove" data-delete{% if project.busy %} disabled{% endif %}>删除配置</button>
+          </form>
+        </section>
+      </section>
+    {% endfor %}
+  </div>
+</aside>

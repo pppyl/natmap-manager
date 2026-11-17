@@ -1,0 +1,51 @@
+{%- macro create_issue(field) -%}
+  <span id="create-error-{{ field }}" class="form-error" data-create-error="{{ field }}" role="alert"{% if not issue or issue.field != field %} hidden{% endif %}>{{ issue.message if issue and issue.field == field else '' }}</span>
+{%- endmacro %}
+{%- macro issue_attributes(field) -%}
+  aria-describedby="create-error-{{ field }}"{% if issue and issue.field == field %} aria-invalid="true"{% endif %}
+{%- endmacro %}
+<dialog class="panel create-dialog" aria-labelledby="new-heading" data-create-dialog{% if open_create %} data-open{% endif %}>
+    <h2 id="new-heading">新建项目</h2>
+    {% set pending = draft and draft.busy %}
+    <form method="post" action="{{ url_for('create_project') }}" data-create-form data-draft="{{ draft.slug if draft else '' }}"
+          data-dashboard-url="{{ url_for('index') }}"{% if pending %} data-pending{% endif %}>
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="draft" value="{{ draft.slug if draft else '' }}">
+      <fieldset class="create-fields" data-create-fields{% if pending %} disabled{% endif %}>
+        <label>项目名称
+          <input name="name" maxlength="60" placeholder="如「项目面板」" value="{{ values.name | default('') }}" {{ issue_attributes('name') }} required autofocus>
+          {{ create_issue('name') }}
+        </label>
+        <label>独立子域名
+          <span class="suffix"><input name="slug" pattern="[a-z0-9]([a-z0-9\x2D]{0,38}[a-z0-9])?" maxlength="40" placeholder="workbench" value="{{ values.slug | default('') }}" {{ issue_attributes('slug') }} required><span>.pages.dev</span></span>
+          {{ create_issue('slug') }}
+        </label>
+        <label>网页端口
+          <input type="number" name="target_port" min="1" max="65535" placeholder="5000" value="{{ values.target_port | default('') }}" {{ issue_attributes('target_port') }} required>
+          {{ create_issue('target_port') }}
+        </label>
+        <details class="advanced-settings"{% if values.target_host == '::1' or values.bind_port or values.scheme in ('http', 'https') or (issue and issue.field in ('target_host', 'bind_port', 'scheme')) %} open{% endif %}>
+          <summary>高级设置</summary>
+          <div class="advanced-fields">
+            <label>网页监听地址
+              <select name="target_host" {{ issue_attributes('target_host') }}>{{ target_host_options(values.target_host) }}</select>
+              {{ create_issue('target_host') }}
+            </label>
+            <label>本地网页协议
+              <select name="scheme" {{ issue_attributes('scheme') }}>{{ scheme_options(values.scheme) }}</select>
+              {{ create_issue('scheme') }}
+            </label>
+            <label>NATMap 本地端口（选填）
+              <input type="number" name="bind_port" min="1" max="65535" placeholder="留空自动分配" value="{{ values.bind_port | default('', true) }}" {{ issue_attributes('bind_port') }}>
+              {{ create_issue('bind_port') }}
+            </label>
+          </div>
+        </details>
+      </fieldset>
+      {{ create_issue('form') }}
+      <div class="actions create-actions">
+        <button class="primary" data-create-submit{% if pending %} disabled{% endif %}>{{ '创建中…' if pending else '创建项目' }}</button>
+        <button type="button" class="secondary" data-close-create>{{ '关闭' if pending else '取消' }}</button>
+      </div>
+    </form>
+</dialog>

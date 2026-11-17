@@ -1,0 +1,95 @@
+{% extends "natmap_base.html" %}
+{% block content %}
+<main class="shell project-shell project-dashboard" data-project-dashboard>
+  <div class="section-heading project-toolbar">
+    <h2 id="projects-heading">项目</h2>
+    <div class="actions">
+      {% if can_import %}
+        <form method="post" action="{{ url_for('change', action='import') }}">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button class="secondary">导入已有项目</button>
+        </form>
+      {% endif %}
+      <a class="primary action-link" href="{{ url_for('new_project') }}" data-open-create aria-haspopup="dialog">新建项目</a>
+    </div>
+  </div>
+  {% for category, message in get_flashed_messages(with_categories=true) %}
+    <p class="notice {{ category }}" role="status">{{ message }}</p>
+  {% endfor %}
+  <p class="notice editor-notice" data-edit-notice role="status" hidden></p>
+  <div class="project-workspace">
+  <div class="project-list-pane">
+    <div class="project-table-container" data-project-list role="region" aria-labelledby="projects-heading" tabindex="0"{% if not projects %} hidden{% endif %}>
+      <table class="project-table" aria-labelledby="projects-heading">
+        <colgroup>
+          <col class="project-name-column">
+          <col class="project-status-column">
+          <col span="2">
+          <col class="project-ports-column">
+          <col class="project-protocol-column">
+          <col class="project-actions-column">
+        </colgroup>
+        <thead>
+          <tr>
+            <th scope="col">项目名称</th>
+            <th scope="col">状态</th>
+            <th scope="col">固定入口</th>
+            <th scope="col">直连地址</th>
+            <th scope="col">本地端口</th>
+            <th scope="col">本地协议</th>
+            <th scope="col">操作</th>
+          </tr>
+        </thead>
+        {% for project in projects %}
+          {% set edit_open = edit_issue and edit_issue.slug == project.slug %}
+          <tbody>
+            <tr id="project-{{ project.slug }}" data-project="{{ project.slug }}">
+              <th scope="row" class="project-name">
+                <span data-project-name title="{{ project.name }}">{{ project.name }}</span>
+              </th>
+              <td class="project-status">
+                <span class="state" data-state="{{ project.phase }}">{{ project.phase }}</span>
+              </td>
+              <td>
+                <div class="address-with-copy">
+                  <a class="entry" href="{{ project.entry }}/" title="{{ project.entry }}/" target="_blank" rel="noopener noreferrer">{{ project.entry | replace('https://', '') }}</a>
+                  <button type="button" class="copy-address" data-copy-address="{{ project.entry }}/" data-address-label="固定入口" aria-label="复制固定入口" aria-live="polite">复制</button>
+                </div>
+              </td>
+              <td>
+                <span class="hint" data-direct-empty>—</span>
+                <div class="address-with-copy" data-direct-address hidden>
+                  <a class="entry" data-direct-link target="_blank" rel="noopener noreferrer"></a>
+                  <button type="button" class="copy-address" data-copy-address="" data-address-label="直连地址" aria-label="复制直连地址" aria-live="polite">复制</button>
+                </div>
+              </td>
+              <td class="project-ports">
+                <div><span>网页</span><strong data-target-port>{{ project.display_target_endpoint | default(project.display_target_port) }}</strong></div>
+                <div><span>NATMap</span><strong data-local-port>{{ project.local_port if project.local_port is not none else '自动分配' }}</strong></div>
+              </td>
+              <td class="project-protocol" data-scheme title="{{ project.scheme_label }}">{{ project.scheme_label }}</td>
+              <td>
+                <form method="post" class="actions project-actions">
+                  <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="slug" value="{{ project.slug }}">
+                  <button class="secondary" formaction="{{ url_for('change', action='mapping') }}" data-run{% if project.busy %} hidden{% endif %}>一键运行</button>
+                  <button class="secondary" formaction="{{ url_for('change', action='stop') }}" data-stop{% if project.phase not in ('运行中', '正在重启') %} hidden{% endif %}>停止</button>
+                  <button type="button" class="secondary" data-manage-toggle aria-controls="manage-{{ project.slug }}" aria-expanded="false"{% if edit_open %} data-show-editor{% endif %}>管理</button>
+                </form>
+              </td>
+            </tr>
+          </tbody>
+        {% endfor %}
+      </table>
+    </div>
+    <p class="panel empty-state" data-empty-projects{% if projects %} hidden{% endif %}>暂无项目</p>
+    <nav class="drafts" data-project-drafts aria-label="项目草稿"{% if not drafts %} hidden{% endif %}>
+      {% for row in drafts %}
+        <a class="entry" href="{{ url_for('new_project', draft=row.slug) }}">继续创建 {{ row.slug }}.pages.dev</a>
+      {% endfor %}
+    </nav>
+  </div>
+  {% include "project_editor.html" %}
+  </div>
+  {% include "project_dialog.html" %}
+</main>
+{% endblock %}

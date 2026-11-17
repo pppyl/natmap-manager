@@ -1,0 +1,420 @@
+"""Forward the local web service and publish its public address to the fixed entry."""
+
+import argparse
+from contextlib import ExitStack, closing
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
+from ipaddress import IPv4Address
+from itertools import cycle
+import json
+import msvcrt
+from pathlib import Path
+from queue import Empty, Queue
+import shutil
+import socket
+import ssl
+import subprocess
+from tempfile import gettempdir
+from threading import Event, Thread
+import time
+from urllib.parse import urlsplit
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
+
+from data_storage import ACCESS_ADDRESS_FILE, PROJECTS_FILE, SETTINGS_FILE, ensure_data
+from pages_projects import PROJECT_NAME, project_token
+
+
+DEFAULT_NATMAP = Path(__file__).with_name("natmap-win-x64.exe")
+DEFAULT_TARGET_HOST = "127.0.0.1"
+TARGET_HOSTS = (DEFAULT_TARGET_HOST, "::1")
+MAPPING_TARGETS = (
+    ("example.com", "turn.cloudflare.com:3478"),
+    ("qq.com", "turn.cloudflare.com:80"),
+)
+KEEPALIVE_SECONDS = 15
+RESTART_DELAY_SECONDS = 5
+ADDRESS_RETRY_DELAY_SECONDS = 15
+FIRST_MAPPING_TIMEOUT_SECONDS = 120
+REDIRECT_RETRY_SECONDS = 30
+REDIRECT_REFRESH_SECONDS = 60
+
+
+def port(value):
+    number = int(value)
+    if not 1 <= number <= 65535:
+        raise argparse.ArgumentTypeError("端口必须在 1 到 65535 之间")
+    return number
+
+
+def target_endpoint(host, port_number):
+    return f"[{host}]:{port_number}" if ":" in host else f"{host}:{port_number}"
+
+
+def available_bind_port(target_port):
+    for _ in range(10):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            probe.bind(("0.0.0.0", 0))
+            bind_port = probe.getsockname()[1]
+            if bind_port != target_port:
+                return bind_port
+    raise OSError("无法分配 NATMap 本地端口。")
+
+
+def parse_mapping(line):
+    # NATMap prints the same six fields it passes to its notification hook.
+    fields = line.split()
+    if len(fields) != 6 or fields[4].lower() != "tcp":
+        return None
+    try:
+        address = IPv4Address(fields[0])
+        public_port = port(fields[1])
+    except (ValueError, argparse.ArgumentTypeError):
+        return None
+    if address.is_global and not address.is_multicast:
+        return address, public_port
+    return None
+
+
+def update_redirect(url, token, scheme, address, public_port, *, system_proxy=False):
+    request = Request(
+        f"{url}/_natmap",
+        data=json.dumps({"ip": str(address), "port": public_port, "scheme": scheme}).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "wxcloud-natmap/1.0",
+        },
+        method="PUT",
+    )
+    open_request = urlopen if system_proxy else build_opener(ProxyHandler({})).open
+    try:
+        with open_request(request, timeout=10) as response:
+            return response.status == 204
+    except (OSError, HTTPException):
+        return False
+
+
+def save_access_address(text):
+    temporary_file = ACCESS_ADDRESS_FILE.with_suffix(".tmp")
+    try:
+        ACCESS_ADDRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary_file.write_text(f"{text}\n", encoding="utf-8-sig")
+        temporary_file.replace(ACCESS_ADDRESS_FILE)
+    except OSError as error:
+        print(f"无法更新 {ACCESS_ADDRESS_FILE.name}（{error.strerror}）。", flush=True)
+
+
+def log_line(message):
+    print(message, flush=True)
+
+
+def detect_origin_scheme(target_port, stop, *, target_host=DEFAULT_TARGET_HOST):
+    # This loopback-only probe identifies TLS even with a local development certificate.
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    probes = (
+        ("https", HTTPSConnection(target_host, target_port, timeout=2, context=context)),
+        ("http", HTTPConnection(target_host, target_port, timeout=2)),
+    )
+    for scheme, connection in probes:
+        if stop.is_set():
+            break
+        try:
+            with closing(connection):
+                connection.request("HEAD", "/")
+                connection.getresponse().close()
+            return scheme
+        except (OSError, HTTPException):
+            continue
+    return None
+
+
+def wait_for_origin(target_port, stop, report, *, scheme, target_host=DEFAULT_TARGET_HOST):
+    previous_message = None
+    endpoint = target_endpoint(target_host, target_port)
+    while not stop.is_set():
+        try:
+            with socket.create_connection((target_host, target_port), timeout=3):
+                pass
+        except OSError:
+            message = f"等待本地网页服务 {endpoint} 启动。"
+        else:
+            detected = detect_origin_scheme(target_port, stop, target_host=target_host) if scheme == "auto" else scheme
+            if detected and not stop.is_set():
+                return detected
+            message = f"本地端口 {endpoint} 已监听，暂未识别 HTTP 或 HTTPS，将继续重试。"
+        if message != previous_message and not stop.is_set():
+            report(message)
+            previous_message = message
+        stop.wait(RESTART_DELAY_SECONDS)
+    return None
+
+
+def read_natmap_output(stream, messages):
+    try:
+        for line in stream:
+            messages.put(line)
+    finally:
+        messages.put(None)
+
+
+def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None,
+                     report=log_line, save_address=save_access_address):
+    """Run one NATMap attempt and report whether the local address could not be reused."""
+    messages = Queue()
+    stop = stop if stop is not None else Event()
+    if stop.is_set():
+        return False
+    mapping = None
+    redirected_mapping = None
+    direct_url = None
+    refresh_redirect_at = 0
+    default_port = 443 if scheme == "https" else 80
+    with subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+    ) as process:
+        reader = Thread(target=read_natmap_output, args=(process.stdout, messages))
+        reader.start()
+        first_mapping_deadline = time.monotonic() + FIRST_MAPPING_TIMEOUT_SECONDS
+        try:
+            while not stop.is_set():
+                try:
+                    line = messages.get(timeout=1)
+                except Empty:
+                    if mapping is None and time.monotonic() >= first_mapping_deadline:
+                        report("等待公网 TCP 映射超时，准备重连。")
+                        return False
+                else:
+                    if line is None:
+                        report(f"NATMap 已停止输出，进程状态 {process.poll()}，准备重连。")
+                        return False
+                    received = parse_mapping(line)
+                    if received is None:
+                        message = line.rstrip()
+                        report(message)
+                        if "Cannot assign requested address" in message:
+                            return True
+                        if message.endswith((
+                            "Start TCP keep-alive service failed.",
+                            "STUN TCP send failed.",
+                            "STUN TCP recv failed.",
+                        )):
+                            report(f"TCP 打洞连接失败，{RESTART_DELAY_SECONDS} 秒后更换保活和 STUN 目标重试。")
+                            return False
+                    elif received != mapping:
+                        mapping = received
+                        refresh_redirect_at = 0
+                        address, public_port = mapping
+                        suffix = "" if public_port == default_port else f":{public_port}"
+                        direct_url = f"{scheme}://{address}{suffix}"
+                        report(f"公网 TCP 映射 {address}:{public_port}。")
+                        report(f"直连地址 {direct_url}")
+                        if redirect:
+                            save_address(f"等待固定入口确认。\n直连地址 {direct_url}")
+
+                if stop.is_set() or not redirect or mapping is None or time.monotonic() < refresh_redirect_at:
+                    continue
+                entry, redirect_token = redirect
+                address, public_port = mapping
+                if update_redirect(entry, redirect_token, scheme, address, public_port, system_proxy=system_proxy):
+                    refresh_redirect_at = time.monotonic() + REDIRECT_REFRESH_SECONDS
+                    if mapping != redirected_mapping:
+                        redirected_mapping = mapping
+                        save_address(f"固定入口 {entry}/\n直连地址 {direct_url}")
+                        report(f"固定入口 {entry}/")
+                else:
+                    refresh_redirect_at = time.monotonic() + REDIRECT_RETRY_SECONDS
+                    redirected_mapping = None
+                    save_address(f"固定入口更新暂未确认。\n直连地址 {direct_url}")
+                    report(f"固定入口更新暂未确认，{REDIRECT_RETRY_SECONDS} 秒后重试。")
+        finally:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+            process.wait()
+            reader.join()
+    return False
+
+
+def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
+               save_address=save_access_address, on_scheme=None):
+    stop = stop if stop is not None else Event()
+    # Also detect a listener from an older launch that predates the lock.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            probe.bind(("0.0.0.0", args.bind_port))
+        except OSError:
+            report(f"无法使用本地 TCP {args.bind_port}。请检查该端口是否被占用。")
+            return 1
+
+    report(f"NATMap 将使用本地 TCP {args.bind_port} 建立映射，保活间隔 {KEEPALIVE_SECONDS} 秒。")
+    configured_scheme = getattr(args, "scheme", None) or ("https" if args.https else "http")
+    target_host = getattr(args, "target_host", DEFAULT_TARGET_HOST)
+    last_scheme = None
+    if redirect:
+        route = "系统代理" if args.system_proxy else "直连"
+        report(f"固定入口上报方式 {route}。")
+    consecutive_address_errors = 0
+    try:
+        for keepalive_host, stun_server in cycle(MAPPING_TARGETS):
+            if redirect:
+                save_address("等待公网映射和固定入口更新。")
+            scheme = wait_for_origin(args.target_port, stop, report, scheme=configured_scheme, target_host=target_host)
+            if scheme is None or stop.is_set():
+                break
+            if redirect:
+                save_address("等待公网映射和固定入口更新。")
+            if scheme != last_scheme:
+                if configured_scheme == "auto":
+                    report(f"检测到本地网页协议为 {scheme.upper()}。")
+                if on_scheme is not None:
+                    on_scheme(scheme)
+                last_scheme = scheme
+            command = [
+                executable, "-4", "-k", str(KEEPALIVE_SECONDS),
+                "-s", stun_server, "-h", keepalive_host,
+                "-b", str(args.bind_port), "-t", target_host, "-p", str(args.target_port),
+            ]
+            report(f"TCP 保活目标 {keepalive_host}:80，STUN 目标 {stun_server}。")
+            address_error = maintain_mapping(command, scheme, redirect, system_proxy=args.system_proxy,
+                                             stop=stop, report=report, save_address=save_address)
+            if stop.is_set():
+                break
+            if redirect:
+                save_address("NATMap 正在重连。")
+            retry_delay = RESTART_DELAY_SECONDS
+            if address_error:
+                consecutive_address_errors += 1
+                if consecutive_address_errors >= len(MAPPING_TARGETS):
+                    retry_delay = ADDRESS_RETRY_DELAY_SECONDS
+                report(f"本地 TCP {args.bind_port} 暂时无法建立连接，{retry_delay} 秒后切换目标重试。")
+            else:
+                consecutive_address_errors = 0
+            stop.wait(retry_delay)
+    finally:
+        if redirect:
+            save_address("NATMap 已停止。")
+    return 0
+
+
+def run_locked_mapping(args, executable, redirect, *, project="", report=log_line, **options):
+    project_lock = f"wxcloud-natmap-project-{project}.lock" if project else "wxcloud-natmap.lock"
+    lock_names = (project_lock, f"wxcloud-natmap-tcp-{args.bind_port}.lock")
+    with ExitStack() as locks:
+        for name in lock_names:
+            lock = locks.enter_context((Path(gettempdir()) / name).open("a+b"))
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except PermissionError:
+                report("该项目已在运行，或 NATMap 本地端口已被其他任务占用。")
+                return 1
+        return run_natmap(args, executable, redirect, report=report, **options)
+
+
+def main():
+    try:
+        ensure_data()
+    except (OSError, ValueError) as error:
+        print(f"无法迁移项目数据：{error}", flush=True)
+        return 1
+    parser = argparse.ArgumentParser(description="建立 NATMap TCP IPv4 映射并更新固定入口")
+    parser.add_argument("--natmap", default=str(DEFAULT_NATMAP), help="NATMap 可执行文件路径")
+    parser.add_argument("--project", help="使用管理页面中已保存项目的子域名")
+    parser.add_argument("--target-host", choices=TARGET_HOSTS, help="本机网页监听地址，默认读取项目设置")
+    parser.add_argument("--target-port", type=port, help="本机网页端口，默认读取项目设置")
+    parser.add_argument("--bind-port", type=port, help="NATMap 本地监听端口，默认读取项目设置")
+    parser.add_argument("--settings", type=Path, help=f"端口和固定入口配置，默认 {SETTINGS_FILE}")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--publish", action="store_true", help="发布到固定入口（默认）")
+    mode.add_argument("--test", dest="publish", action="store_false", help="只打洞并显示公网测试地址")
+    parser.set_defaults(publish=True)
+    parser.add_argument("--system-proxy", action="store_true", help="使用系统代理上报固定入口，默认直连")
+    parser.add_argument("--https", action="store_true", help="本地服务已启用 HTTPS 时，显示 HTTPS 链接")
+    args = parser.parse_args()
+
+    project = None
+    if args.project:
+        args.project = args.project.strip().lower()
+        if not PROJECT_NAME.fullmatch(args.project):
+            parser.error("项目子域名无效。")
+        try:
+            project_data = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
+            projects = project_data.get("projects", []) if isinstance(project_data, dict) else project_data
+            project = next(item for item in projects if item.get("slug") == args.project)
+            if not project.get("entry"):
+                raise ValueError
+        except (OSError, ValueError, TypeError, AttributeError, StopIteration):
+            parser.error("找不到已创建的项目，请检查 --project 指定的子域名。")
+
+    try:
+        settings = {}
+        if args.settings or SETTINGS_FILE.is_file():
+            settings = json.loads((args.settings or SETTINGS_FILE).read_text(encoding="utf-8-sig"))
+            if not isinstance(settings, dict):
+                raise ValueError
+        target_port = project.get("target_port") if project else settings.get("target_port", 21580)
+        args.target_port = args.target_port or port(str(target_port))
+        origin_settings = project if project else settings
+        args.target_host = args.target_host or origin_settings.get("target_host", DEFAULT_TARGET_HOST)
+        if args.target_host not in TARGET_HOSTS:
+            parser.error("本机网页监听地址须为 127.0.0.1 或 ::1。")
+        bind_port = project.get("bind_port") if project else settings.get("bind_port", 21581)
+        args.bind_port = args.bind_port or (port(str(bind_port)) if bind_port else available_bind_port(args.target_port))
+        if project:
+            args.scheme = "https" if args.https else project.get("scheme", "http")
+            if args.scheme not in ("auto", "http", "https"):
+                raise ValueError
+    except (OSError, ValueError, argparse.ArgumentTypeError):
+        parser.error("无法读取设置，请检查 JSON 格式和端口范围。")
+
+    redirect = None
+    if args.publish:
+        try:
+            redirect_settings = settings["redirect"]
+            entry_url = project["entry"] if project else redirect_settings["url"]
+            entry = urlsplit(entry_url)
+            redirect_token = redirect_settings["token"]
+            if (
+                entry.scheme != "https"
+                or not entry.hostname
+                or not entry.hostname.endswith((".pages.dev", ".workers.dev"))
+                or entry.netloc != entry.hostname
+                or entry.path not in ("", "/")
+                or entry.query or entry.fragment
+                or not isinstance(redirect_token, str) or not redirect_token.strip()
+            ):
+                raise ValueError
+            redirect_token = redirect_token.strip()
+            if project and project.get("owner"):
+                redirect_token = project_token(redirect_token, args.project)
+            redirect = (f"https://{entry.hostname}", redirect_token)
+        except (KeyError, TypeError, AttributeError, ValueError):
+            parser.error("发布模式需要有效的固定入口和更新令牌。请用 --project 指定已保存的项目。")
+
+    if args.bind_port == args.target_port:
+        parser.error("NATMap 监听端口必须与网页端口不同")
+    executable = shutil.which(args.natmap)
+    if executable is None:
+        parser.error("找不到 NATMap，请通过 --natmap 指定 Windows 可执行文件")
+
+    print("按 Ctrl+C 停止。", flush=True)
+    try:
+        redirect_settings = settings.get("redirect")
+        legacy_url = redirect_settings.get("url", "") if isinstance(redirect_settings, dict) else ""
+        legacy_project = project and isinstance(legacy_url, str) and project["entry"].rstrip("/") == legacy_url.rstrip("/")
+        lock_project = "" if legacy_project else args.project or ""
+        return run_locked_mapping(args, executable, redirect, project=lock_project)
+    except KeyboardInterrupt:
+        return 0
+    except OSError as error:
+        print(f"无法运行 NATMap（{error.strerror}）。")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,24 @@
+{% for profile in profiles %}
+  <article class="panel profile-card">
+    <div class="project-header">
+      <h3>{{ profile.name }}</h3>
+      {% if default_id == profile.id %}<span class="state">默认用于新建</span>{% endif %}
+    </div>
+    <dl class="platform-info">
+      <div><dt>Cloudflare 账号 ID</dt><dd><code>{{ profile.account_id }}</code></dd></div>
+      <div><dt>授权来源</dt><dd>{{ profile.auth_label }}{% if profile.auth_source != 'wrangler' %} · {{ '已配置' if profile.token_configured else '未配置' }}{% endif %}</dd></div>
+      <div><dt>D1 数据库</dt><dd>{{ profile.database_name }}</dd></div>
+      <div><dt>D1 数据库 ID</dt><dd><code>{{ profile.database_id }}</code></dd></div>
+    </dl>
+    <form method="post" class="actions">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="profile_id" value="{{ profile.id }}">
+      <a class="secondary action-link" href="{{ url_for('platform_settings', profile=profile.id) }}#connection-editor">修改</a>
+      <button class="secondary" formaction="{{ url_for('change_platform', action='check') }}">检查连接</button>
+      {% if default_id != profile.id %}<button class="secondary" formaction="{{ url_for('change_platform', action='default') }}">设为默认</button>{% endif %}
+      <button class="remove" formaction="{{ url_for('change_platform', action='delete') }}">删除本机配置</button>
+    </form>
+  </article>
+{% else %}
+  <p class="panel empty-state">暂无连接配置。登录 Cloudflare 后将自动获取。</p>
+{% endfor %}

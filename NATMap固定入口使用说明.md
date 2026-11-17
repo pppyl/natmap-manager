@@ -1,0 +1,188 @@
+# NATMap 固定入口使用说明
+
+## 从仓库取回项目
+
+使用原来的项目时，将自己备份的 `data` 目录放回项目根目录。已有固定入口需要使用原来的更新令牌。
+
+从空目录开始时，在项目根目录运行下面的命令，为本机生成更新令牌。已有设置文件时会保留原文件。
+
+```powershell
+py -c "import json, secrets; from pathlib import Path; p = Path('data/settings.json'); p.parent.mkdir(exist_ok=True); p.exists() or p.write_text(json.dumps({'redirect': {'token': secrets.token_urlsafe(32)}}), encoding='utf-8')"
+```
+
+## 网页管理
+
+双击同一目录的 `启动NATMap管理.cmd`。管理页会在本机浏览器打开，地址是 `http://127.0.0.1:8765/`。
+
+管理程序启动后，会自动运行所有已创建项目的打洞任务。网页服务如果尚未启动，项目会等待它启动后继续打洞。
+
+1. 启动要转发的网页项目。
+2. 点击项目列表右上角的「新建项目」，在弹窗中填写项目名、独立子域名和网页端口，再点「创建项目」。地址被占用时，子域名下方会提示更换，已填内容会保留。创建成功后，弹窗自动关闭，新项目会显示在列表中。
+3. 已保存的项目会在管理程序启动时自动运行。新建项目创建成功后，在项目行点「一键运行」。项目默认检测本地网页协议，并自动分配 NATMap 本地端口。需要手动指定时，可以在新建表单中展开「高级设置」。检测结果会在项目行显示，并用于跳转后的直连地址。Pages 固定入口使用 HTTPS。多个项目可以同时运行。
+4. 在项目行点击「管理」，可同时查看配置和运行日志。业务监听 `[::1]:5000` 时，选「IPv6（::1）」并填写端口 `5000`。运行中的项目保存后会自动重启，停止的项目会在下次启动时使用新配置。可在侧栏底部删除本机配置，Cloudflare 上的 Pages 项目继续保留。
+
+保持管理窗口运行。关闭管理窗口会停止它启动的打洞任务。如果已经用命令行启动了同一项目，先在对应终端按 `Ctrl+C`，再点管理页里的「一键运行」。
+
+首次创建新 Pages 项目需要本机有 Node.js、npx 和已授权的 Cloudflare Pages 登录。遇到开发工具缺失可以按日志提示处理。如果 Python 缺少 Flask，在项目目录执行 `py -m pip install -r requirements.txt`。
+
+## 平台配置
+
+管理页右上角的「平台配置」可以查看 Cloudflare 账号、D1 数据库、Wrangler 登录状态、有效期和实际授权范围。可以新增、修改、删除本机的连接配置，并选择新建项目使用的默认配置。点「检查连接」可以验证当前凭据能否读取 Pages 和所选 D1 数据库。
+
+授权来源可以选择项目内的 Wrangler 登录、单独填写 API Token，或读取本机的 `CLOUDFLARE_API_TOKEN` 环境变量。编辑 API Token 配置时，留空可保留当前令牌。平台配置保存在项目的 `data\platforms.json`。
+
+Wrangler 是程序用于创建和管理 Pages 项目的 Cloudflare 工具。需要登录或重新授权时，在「平台配置」点击「登录 Cloudflare」，在打开的页面登录并点击 `Allow`，再回到管理页。登录成功后程序会自动获取账号和 D1 数据库，添加连接配置。多个可选连接无法自动确定时，在页面选择即可。如果账号没有 D1 数据库，程序会创建 `natmap-redirect`。已登录时通常无需重复登录，授权到期后程序会尝试自动刷新。已登录但连接配置为空时，可以点击「自动获取连接配置」。
+
+Wrangler 登录保存在 `data\wrangler`。迁移时原来的共享 Wrangler 授权文件会保留，两个位置的授权信息分别刷新，其他项目如果提示授权失效，可以重新登录。
+
+新建 Pages 项目需要 Pages 写权限。检查 D1 需要 D1 读或写权限。选择新的 D1 数据库时，程序会在首次部署时准备 NATMap 数据表，建表需要 D1 写权限。删除本机连接配置后，可以用剩余的连接配置继续新建项目。各已部署项目仍通过自己的固定入口上报。
+
+## 固定访问地址
+
+手机收藏管理页面中对应项目行的固定地址即可。每个项目有自己的固定地址。
+
+Python 将 NATMap 拿到的公网 IPv4 和端口直接发给 Cloudflare Pages。Pages Functions 将当前地址写入 D1。手机打开这个网址后，会收到 `302` 跳转，然后直接连接电脑的公网 IP 和端口。无需配置 DuckDNS。
+
+公网 IP 或端口变化时，Python 会立即同步新的直连地址。程序运行时每 60 秒刷新一次，固定入口在 3 分钟未收到刷新后会显示暂时离线。
+
+## 需要保持运行的两个程序
+
+外网访问依赖下面两个程序同时运行。
+
+1. 要在外网访问的本地网页服务。下面的示例使用端口 `21580`。
+2. NATMap 管理程序，或单项目命令行程序 `duckdns_natmap.py`。
+
+电脑关机、重启、休眠或断网时，外网入口会暂时不可用。当前没有配置 Windows 开机自启。
+
+## 单项目的命令行启动方法
+
+### 第一步　启动网页服务
+
+按项目自己的方式启动网页服务。如果项目的 Python 入口是 `app.py`，可以在其目录打开 PowerShell 运行下面的命令。
+
+```powershell
+python app.py
+```
+
+在电脑上打开 `http://127.0.0.1:21580/`，确认能看到该项目的网页。如果项目监听其他端口，下一步用实际端口替换 `21580`。
+
+### 第二步　启动 NATMap 和固定入口同步
+
+在 NATMap 项目目录打开一个新的 PowerShell 窗口，运行下面的命令。
+
+```powershell
+py .\duckdns_natmap.py --project my-project
+```
+
+`--project` 后填写项目固定网址中 `.pages.dev` 前的子域名。程序从管理页面保存的项目设置读取网页端口、NATMap 本地端口和协议。留空的 NATMap 端口会自动分配。Python 默认直连上报公网地址。
+
+这个窗口也需要保持打开。正常启动后会看到类似信息。
+
+```text
+公网 TCP 映射 <公网IPv4>:<公网端口>。
+直连地址 http://<公网IPv4>:<公网端口>
+固定入口 https://<项目子域名>.pages.dev/
+```
+
+公网 IP 和端口只是示例。实际数值由运营商分配，可能在重拨或重启后变化。
+
+### 第三步　确认访问地址
+
+打开项目目录中的文件可以查看当前地址。
+
+```text
+.\data\当前访问地址.txt
+```
+
+出现 `固定入口` 后，用手机流量打开收藏的地址。首次通过公网 IP 进入网页时，浏览器可能会要求重新登录。
+
+## 自定义端口
+
+`--target-port` 可以临时指定网页实际监听的端口，`--bind-port` 可以临时指定 NATMap 的本地映射端口。它们不会修改管理页面保存的项目设置。
+
+例如，将项目临时转发到本机 `5000` 端口时，可以运行下面的命令。
+
+```powershell
+py .\duckdns_natmap.py --project my-project --target-port 5000 --bind-port 21581
+```
+
+`--bind-port` 不能与网页服务端口相同。运营商可能把它改写成另一个公网端口，因此不能依靠它固定公网端口。
+
+## 停止服务
+
+在 NATMap 的 PowerShell 窗口按 `Ctrl+C`，可以停止打洞和固定入口同步。
+
+在网页服务窗口按 `Ctrl+C`，可以停止网页服务。
+
+停止任一程序后，手机将无法通过固定入口访问网页。
+
+## 常见问题
+
+### 一直显示等待本地网页服务
+
+这表示 NATMap 找不到目标端口。先确认网页服务已经启动，再检查 `--target-port` 是否与网页服务端口一致。
+
+### 提示项目已经在运行
+
+这表明电脑上已经有一个 NATMap 实例。打开 `data\当前访问地址.txt` 可以查看该实例正在使用的地址。
+
+### 刚关闭又启动时出现 Cannot assign requested address
+
+关闭旧连接后，Windows 可能仍保留本地映射端口到保活或 STUN 服务器的连接状态（`TIME_WAIT`）。第一次遇到这类错误，程序会在 5 秒后切换目标重试。两组目标连续报错后，每隔 15 秒重试，继续使用指定的本地 `--bind-port`。让窗口保持运行，看到 `公网 TCP 映射` 后即可测试直连地址。
+
+### 固定入口显示电脑离线
+
+确认电脑没有休眠，网页服务和 NATMap 窗口仍在运行。网络恢复后，程序会自动重新打洞并更新入口。
+
+### 固定入口更新暂未确认
+
+程序每隔 30 秒重试。请用文末的命令检查本机能否直连固定入口。若入口暂时不可用，NATMap 仍会给出公网 IP 和端口，可以用状态文件里的直连地址测试。上一次成功同步约 3 分钟后，入口会显示暂时离线。
+
+如果连接正常，请检查管理页面中的项目固定地址和下面设置文件中的更新令牌。
+
+```text
+.\data\settings.json
+```
+
+不要发送或公开这个文件。
+
+### 页面能打开但浏览器提示连接不安全
+
+固定入口使用 HTTPS，当前跳转目标使用 HTTP。若要用 `--https` 发布直连地址，本地服务需要启用 HTTPS，并使用对浏览器访问的公网 IP 有效的证书。
+
+## 相关文件
+
+```text
+.\duckdns_natmap.py
+.\data_storage.py
+.\natmap_manager.py
+.\启动NATMap管理.cmd
+.\natmap-win-x64.exe
+.\data\当前访问地址.txt
+.\data\settings.json
+.\data\projects.json
+.\data\platforms.json
+.\data\wrangler.jsonc
+.\data\wrangler\.wrangler\config\default.toml
+.\pages\public\_worker.js
+.\pages\migrations\0001_create_natmap_target.sql
+.\pages\migrations\0002_create_project_targets.sql
+```
+
+`data` 包含 Pages 更新令牌、Cloudflare 授权及项目配置。备份时请一起保存，不要公开或提交到代码仓库。项目目录下的 `.gitignore` 已排除 `data`。
+
+## 检查运行状态
+
+可以在 PowerShell 中检查网页端口和 NATMap 端口。
+
+```powershell
+Get-NetTCPConnection -LocalPort 5000,21580,21581 -State Listen -ErrorAction SilentlyContinue
+```
+
+把下面网址换成自己的固定入口，检查是否可以直连并返回跳转。
+
+```powershell
+curl.exe --noproxy '*' -I --max-time 8 'https://my-project.pages.dev/'
+```
+
+正常情况下会看到 `302`，`Location` 指向状态文件中的公网 IPv4 和端口。收到 `503` 时，表示已连上 Pages，但 NATMap 的地址尚未同步或已经过期。

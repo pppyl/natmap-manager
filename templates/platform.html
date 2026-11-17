@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>平台配置 · NATMap 管理</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='natmap.css') }}">
+  <script src="{{ url_for('static', filename='platform.js') }}" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="shell masthead-row">
+      <div><h1>平台配置</h1><p>Cloudflare 连接与授权</p></div>
+      <nav class="masthead-nav" aria-label="管理导航"><a href="{{ url_for('index') }}">返回项目</a></nav>
+    </div>
+  </header>
+  <main class="shell layout">
+    <section aria-labelledby="connections-heading">
+      {% for category, message in get_flashed_messages(with_categories=true) %}
+        <p class="notice {{ category }}" role="status">{{ message }}</p>
+      {% endfor %}
+      <div class="section-heading">
+        <h2 id="connections-heading">连接配置</h2>
+        <a class="secondary action-link" href="{{ url_for('platform_settings', new=1) }}">新增配置</a>
+      </div>
+      <div data-platform-profiles data-revision="{{ login.revision }}">{% include 'platform_profiles.html' %}</div>
+      <section class="panel auth-panel" aria-labelledby="wrangler-heading">
+        <div class="project-header"><h3 id="wrangler-heading">Cloudflare 登录</h3><span class="state" data-wrangler-status>{{ wrangler.status }}</span></div>
+        <p class="auth-description">登录后自动获取账号和数据库，创建连接配置。已登录时通常无需重复登录，授权到期后会尝试自动刷新。</p>
+        <form method="post" action="{{ url_for('change_platform', action='login') }}">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button class="primary" data-login-button{% if login.phase in ('starting', 'waiting', 'configuring') %} disabled{% endif %}>{{ '重新登录 Cloudflare' if wrangler.status == '已登录' else '登录 Cloudflare' }}</button>
+          <button class="secondary" data-discover-button formaction="{{ url_for('change_platform', action='discover') }}"{% if login.phase in ('starting', 'waiting', 'configuring') %} disabled{% endif %}>自动获取连接配置</button>
+        </form>
+        <p class="auth-feedback" data-login-message role="status"{% if not login.message %} hidden{% endif %}>{{ login.message }}</p>
+        <a class="entry auth-link" data-login-link{% if login.url %} href="{{ login.url }}"{% else %} hidden{% endif %} target="_blank" rel="noopener noreferrer">如果没有自动打开，点击这里登录</a>
+        <form method="post" action="{{ url_for('change_platform', action='choose') }}" class="choice-form" data-connection-choices{% if login.phase != 'choose' or not login.choices %} hidden{% endif %}>
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <label>选择账号和数据库
+            <select name="connection" data-connection-select required>{% for choice in login.choices %}<option value="{{ choice.value }}">{{ choice.label }}</option>{% endfor %}</select>
+          </label>
+          <button class="secondary">使用此连接</button>
+        </form>
+        <details>
+          <summary>查看授权详情</summary>
+          <dl class="platform-info">
+            <div data-expiry-row{% if not wrangler.expires_at %} hidden{% endif %}><dt>访问令牌有效期</dt><dd data-wrangler-expiry>{{ wrangler.expires_at }}</dd></div>
+          </dl>
+          <ul class="scope-list" data-wrangler-scopes aria-label="已授权的权限范围">
+            {% for scope in wrangler.scopes %}
+              <li><code>{{ scope }}</code>{% if scope in wrangler.labels %}<span>{{ wrangler.labels[scope] }}</span>{% endif %}</li>
+            {% endfor %}
+          </ul>
+          <p class="hint" data-no-scopes{% if wrangler.scopes %} hidden{% endif %}>本机暂无 Wrangler 授权范围可显示。</p>
+          <details><summary>手动登录（高级）</summary><pre class="log">{{ login_command }}</pre></details>
+        </details>
+      </section>
+    </section>
+    <aside aria-labelledby="connection-editor">
+      <div class="panel">
+        <h2 id="connection-editor">{{ '修改配置' if selected else '新增配置' }}</h2>
+        {% if issue %}<p class="notice error" role="alert">{{ issue }}</p>{% endif %}
+        <form method="post" action="{{ url_for('change_platform', action='save') }}" class="connection-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="profile_id" value="{{ selected.id if selected else '' }}">
+          <label>配置名称<input name="name" maxlength="60" value="{{ values.name | default('') }}" required></label>
+          <label>Cloudflare 账号 ID<input name="account_id" maxlength="32" spellcheck="false" value="{{ values.account_id | default('') }}" required></label>
+          <label>D1 数据库名称<input name="database_name" maxlength="63" value="{{ values.database_name | default('') }}" required></label>
+          <label>D1 数据库 ID<input name="database_id" maxlength="36" spellcheck="false" value="{{ values.database_id | default('') }}" required></label>
+          <label>授权来源
+            <select name="auth_source">{% for key, label in auth_labels.items() %}<option value="{{ key }}"{% if values.auth_source == key %} selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+          </label>
+          <label>API Token（仅此方式需要）
+            <input type="password" name="api_token" autocomplete="new-password" maxlength="512" placeholder="{{ '留空保留当前令牌' if selected and selected.auth_source == 'token' else '输入 Cloudflare API Token' }}">
+          </label>
+          <label class="check-option"><input type="checkbox" name="make_default" value="1"{% if selected and selected.id == default_id %} checked{% endif %}>设为新建项目的默认配置</label>
+          <button class="primary create-button">保存配置</button>
+        </form>
+      </div>
+    </aside>
+  </main>
+</body>
+</html>

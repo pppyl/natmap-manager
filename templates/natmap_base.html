@@ -1,0 +1,28 @@
+<!doctype html>
+{%- macro scheme_options(selected) -%}
+  {% for value, label in [('auto', '自动检测'), ('http', 'HTTP'), ('https', 'HTTPS')] %}
+    <option value="{{ value }}"{% if selected == value %} selected{% endif %}>{{ label }}</option>
+  {% endfor %}
+{%- endmacro %}
+{%- macro target_host_options(selected) -%}
+  <option value="127.0.0.1"{% if selected != '::1' %} selected{% endif %}>IPv4（127.0.0.1）</option>
+  <option value="::1"{% if selected == '::1' %} selected{% endif %}>IPv6（::1）</option>
+{%- endmacro %}
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}NATMap 管理{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='natmap.css') }}">
+  <script src="{{ url_for('static', filename='natmap.js') }}" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="shell masthead-row project-shell">
+      <div><h1>NATMap 管理</h1><p>管理本机项目的公网入口</p></div>
+      <nav class="masthead-nav" aria-label="管理导航"><a href="{{ url_for('platform_settings') }}">平台配置</a></nav>
+    </div>
+  </header>
+  {% block content %}{% endblock %}
+</body>
+</html>
