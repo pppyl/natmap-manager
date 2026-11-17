@@ -344,11 +344,14 @@ class PagesProjects:
         self.platform = platform if platform is not None else default_platform()
         self.account = self.platform.account_id
         self.config = pages_config()
-        self.legacy_database = self.config["d1_databases"][0]["database_id"]
+        legacy_databases = self.config.get("d1_databases", [])
+        self.legacy_database = legacy_databases[0]["database_id"] if legacy_databases else None
+        self.config.setdefault("compatibility_date", "2026-11-16")
         self.config["d1_databases"] = [{
             "binding": "REDIRECT_DB", "database_name": self.platform.database_name,
             "database_id": self.platform.database_id,
         }]
+
     def wrangler(self, *args, cwd=None):
         environment = wrangler_environment()
         environment["CLOUDFLARE_ACCOUNT_ID"] = self.account

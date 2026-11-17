@@ -4,6 +4,7 @@ import json
 import msvcrt
 import os
 from pathlib import Path
+from secrets import token_urlsafe
 from tempfile import NamedTemporaryFile, gettempdir
 
 
@@ -64,7 +65,7 @@ def _pages_config(contents):
 
 
 def ensure_data():
-    """Move the old application files once and copy the shared Wrangler login."""
+    """Migrate legacy files and initialize settings for a fresh installation."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = DATA_DIR / ".migration.lock"
     with lock_path.open("a+b") as lock:
@@ -72,16 +73,19 @@ def ensure_data():
         msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
         try:
             marker = DATA_DIR / ".migration-complete"
-            if marker.exists():
-                return
-            legacy_dir = Path(os.environ.get("LOCALAPPDATA", gettempdir())) / "wxcloud-natmap"
-            for name in ("settings.json", "projects.json", "platforms.json"):
-                _migrate_file(legacy_dir / name, DATA_DIR / name)
-            _migrate_file(PROJECT_DIR / "当前访问地址.txt", ACCESS_ADDRESS_FILE)
-            _migrate_file(PROJECT_DIR / "pages" / "wrangler.jsonc", PAGES_CONFIG_FILE, transform=_pages_config)
-            shared_profile = Path(os.environ.get("APPDATA", "")) / "xdg.config/.wrangler/config/default.toml"
-            _migrate_file(shared_profile, WRANGLER_PROFILE_FILE, remove_source=False)
-            _write_bytes(marker, b"1\n")
+            if not marker.exists():
+                legacy_dir = Path(os.environ.get("LOCALAPPDATA", gettempdir())) / "wxcloud-natmap"
+                for name in ("settings.json", "projects.json", "platforms.json"):
+                    _migrate_file(legacy_dir / name, DATA_DIR / name)
+                _migrate_file(PROJECT_DIR / "当前访问地址.txt", ACCESS_ADDRESS_FILE)
+                _migrate_file(PROJECT_DIR / "pages" / "wrangler.jsonc", PAGES_CONFIG_FILE, transform=_pages_config)
+                shared_profile = Path(os.environ.get("APPDATA", "")) / "xdg.config/.wrangler/config/default.toml"
+                _migrate_file(shared_profile, WRANGLER_PROFILE_FILE, remove_source=False)
+                _write_bytes(marker, b"1\n")
+            # Existing projects need their original token to update their Pages endpoints.
+            if not SETTINGS_FILE.exists() and not PROJECTS_FILE.exists():
+                settings = {"redirect": {"token": token_urlsafe(32)}}
+                _write_bytes(SETTINGS_FILE, (json.dumps(settings, indent=2) + "\n").encode("utf-8"))
         finally:
             lock.seek(0)
             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)

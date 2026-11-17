@@ -23,7 +23,10 @@ SCOPE_LABELS = {
 
 
 def pages_config():
-    return json.loads(PAGES_CONFIG_FILE.read_text(encoding="utf-8"))
+    try:
+        return json.loads(PAGES_CONFIG_FILE.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return {}
 
 
 def read_wrangler_profile():

@@ -4,11 +4,7 @@
 
 使用原来的项目时，将自己备份的 `data` 目录放回项目根目录。已有固定入口需要使用原来的更新令牌。
 
-从空目录开始时，在项目根目录运行下面的命令，为本机生成更新令牌。已有设置文件时会保留原文件。
-
-```powershell
-py -c "import json, secrets; from pathlib import Path; p = Path('data/settings.json'); p.parent.mkdir(exist_ok=True); p.exists() or p.write_text(json.dumps({'redirect': {'token': secrets.token_urlsafe(32)}}), encoding='utf-8')"
-```
+全新部署时，第一次打开管理程序会自动创建 `data/settings.json` 并生成本地更新令牌。进入「平台配置」登录 Cloudflare，程序会获取可用的账号和 D1 数据库，并在新建项目时生成 Pages 部署配置。
 
 ## 网页管理
 
@@ -162,7 +158,7 @@ py .\duckdns_natmap.py --project my-project --target-port 5000 --bind-port 21581
 .\data\settings.json
 .\data\projects.json
 .\data\platforms.json
-.\data\wrangler.jsonc
+.\data\wrangler.jsonc（旧版部署配置，存在时用于兼容）
 .\data\wrangler\.wrangler\config\default.toml
 .\pages\public\_worker.js
 .\pages\migrations\0001_create_natmap_target.sql
