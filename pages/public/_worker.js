@@ -1,6 +1,13 @@
 const UPDATE_PATH = "/_natmap";
+const COMMAND_PATH = "/_natmap/remote";
 const LEASE_MS = 180_000;
 const NO_CACHE = { "Cache-Control": "no-store" };
+const REMOTE_HEADERS = {
+  ...NO_CACHE,
+  "Referrer-Policy": "no-referrer",
+  "X-Robots-Tag": "noindex, nofollow",
+  "X-NATMap-Remote-Version": "3",
+};
 const encoder = new TextEncoder();
 
 function isPublicIPv4(ip) {
@@ -35,6 +42,15 @@ function authorized(request, token) {
     crypto.subtle.timingSafeEqual(supplied, expected);
 }
 
+async function serveRemoteAsset(request, env, pathname) {
+  const assetRequest = new Request(new URL(pathname, request.url), request);
+  const asset = await env.ASSETS.fetch(assetRequest);
+  const headers = new Headers(asset.headers);
+  for (const [name, value] of Object.entries(REMOTE_HEADERS)) headers.set(name, value);
+  headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'");
+  return new Response(asset.body, { status: asset.status, headers });
+}
+
 export default {
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
@@ -51,11 +67,10 @@ export default {
       }
       const { ip, port, scheme } = payload ?? {};
       if (!isPublicIPv4(ip) || !Number.isInteger(port) || port < 1 || port > 65535 ||
-          (scheme !== "http" && scheme !== "https")) {
+          !["http", "https", "tcp"].includes(scheme)) {
         return new Response("Invalid public IPv4, port or scheme", { status: 400, headers: NO_CACHE });
       }
-      const target = new URL(`${scheme}://${ip}`);
-      target.port = String(port);
+      const target = new URL(`${scheme}://${ip}:${port}`);
       await env.REDIRECT_DB.prepare(`
         INSERT INTO natmap_projects (project, location, expires_at) VALUES (?, ?, ?)
         ON CONFLICT(project) DO UPDATE SET location = excluded.location, expires_at = excluded.expires_at
@@ -63,13 +78,31 @@ export default {
       return new Response(null, { status: 204, headers: NO_CACHE });
     }
 
-    if (pathname !== "/" || (request.method !== "GET" && request.method !== "HEAD")) {
+    if (request.method !== "GET" && request.method !== "HEAD") {
       return new Response(null, { status: 404, headers: NO_CACHE });
     }
-    const location = await env.REDIRECT_DB.prepare(`
-      SELECT location FROM natmap_projects WHERE project = ? AND expires_at > ?
-    `).bind(project, Date.now()).first("location");
-    if (!location) {
+    if (pathname === "/remote/" || pathname === "/remote/connection.js") {
+      return serveRemoteAsset(request, env, pathname);
+    }
+    const remote = pathname === COMMAND_PATH;
+    if (!remote && pathname !== "/") return new Response(null, { status: 404, headers: NO_CACHE });
+    const mapping = await env.REDIRECT_DB.prepare(`
+      SELECT location, expires_at FROM natmap_projects WHERE project = ?
+    `).bind(project).first();
+    const location = mapping?.expires_at > Date.now() ? mapping.location : "";
+    if (remote) {
+      const address = location?.match(/^tcp:\/\/((\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5}))$/);
+      if (!address || !isPublicIPv4(address[2]) || Number(address[3]) < 1 || Number(address[3]) > 65535) {
+        return new Response(null, { status: 503, headers: { ...REMOTE_HEADERS, "Retry-After": "15" } });
+      }
+      return new Response(request.method === "HEAD" ? null : address[1], {
+        headers: { ...REMOTE_HEADERS, "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
+    if (mapping?.location?.startsWith("tcp://")) {
+      return serveRemoteAsset(request, env, "/remote/");
+    }
+    if (!location || !/^https?:\/\//.test(location)) {
       return new Response(
         request.method === "HEAD" ? null : "电脑暂时离线或正在重新打洞，请稍后重试。",
         {

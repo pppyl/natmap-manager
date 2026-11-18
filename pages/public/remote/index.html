@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>远程桌面</title>
+  <style>
+    :root { color-scheme: light; font: 16px/1.55 system-ui, sans-serif; color: #132527; background: #f1f5f4; }
+    main { max-width: 34rem; margin: 10vh auto; padding: 1.5rem; background: white; border: 1px solid #dce6e2; border-radius: 12px; }
+    body { margin: 0 1rem; }
+    h1, p { margin: 0 0 1rem; }
+    code { display: block; overflow-wrap: anywhere; background: #edf4f2; padding: .7rem; border-radius: 6px; margin-bottom: 1rem; }
+    button { background: #086356; color: white; border: 0; border-radius: 6px; padding: .65rem 1rem; font: inherit; cursor: pointer; margin: 0 .35rem .7rem 0; }
+    button:disabled { opacity: .55; cursor: default; }
+    #copy { background: #edf4f2; color: #132527; }
+  </style>
+  <script src="/remote/connection.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>远程桌面</h1>
+    <p id="status" role="status">正在获取连接地址…</p>
+    <div id="connection" hidden>
+      <code id="command"></code>
+      <button id="download" type="button">下载远程连接</button>
+      <button id="copy" type="button">复制命令</button>
+      <p>在 Windows 控制端打开下载的 .rdp 文件，按提示登录。</p>
+    </div>
+  </main>
+</body>
+</html>

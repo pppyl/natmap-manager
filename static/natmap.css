@@ -93,13 +93,18 @@ input:focus, select:focus { outline: 2px solid #229781; outline-offset: 1px; }
 .editor-heading { position: sticky; top: 0; z-index: 1; padding: 16px 0 12px; background: #fff; border-bottom: 1px solid var(--line); }
 .editor-heading h2 { min-width: 0; overflow-wrap: anywhere; }
 .editor-heading button { flex: none; }
+.rdp-command { margin-bottom: 16px; }
+.rdp-command code { font: .75rem/1.5 Consolas, monospace; overflow-wrap: anywhere; }
 .editor-panel .edit-grid { grid-template-columns: minmax(0, 1fr); }
 .editor-panel .project-more { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
 .editor-panel .project-more :is(.log, .project-detail, .configuration-note) { max-height: none; }
 .editor-notice { position: fixed; right: 18px; bottom: 16px; z-index: 3; margin: 0; max-width: calc(100% - 36px); box-shadow: 0 3px 14px #152f2926; }
-.project-toolbar { margin-bottom: 16px; }
+.project-toolbar { margin-bottom: 16px; flex-wrap: wrap; }
 .project-toolbar h2, .create-dialog h2 { font-size: 1.375rem; }
 .project-toolbar .primary { border-color: var(--accent); }
+.project-sort select { width: auto; }
+.project-order { display: flex; gap: 6px; margin-top: 3px; }
+.project-order button { min-width: 32px; min-height: 26px; padding: 0 6px; line-height: 1.15; }
 .project-table-container { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
 .project-table { width: 100%; min-width: 1280px; table-layout: fixed; border-collapse: collapse; text-align: left; font-size: .875rem; }
 .project-name-column { width: 6.5rem; }
@@ -129,6 +134,12 @@ input:focus, select:focus { outline: 2px solid #229781; outline-offset: 1px; }
 .project-status .state[data-waiting] { color: #82500c; background: #fff1d7; }
 .address-with-copy { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
 .address-with-copy .entry { max-width: 100%; font-size: .8125rem; line-height: 1.25; }
+.project-table [data-rdp] .project-direct { padding-block: 3px; }
+.project-table [data-rdp-link] {
+  display: flex;
+  flex-wrap: wrap;
+  font: .667rem/1.2 Consolas, monospace;
+}
 .project-protocol { font-size: .8125rem; }
 .project-ports { white-space: nowrap; }
 .project-ports div { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }

@@ -6,9 +6,10 @@ from dataclasses import asdict, dataclass, field, replace
 import hmac
 import json
 from pathlib import Path
-from secrets import token_urlsafe
+from secrets import token_hex, token_urlsafe
 import socket
 from threading import Event, Lock, RLock, Thread
+from time import monotonic
 from urllib.parse import urlsplit
 import webbrowser
 
@@ -16,13 +17,15 @@ from flask import Flask, abort, flash, jsonify, redirect, render_template, reque
 from werkzeug.serving import make_server
 
 from data_storage import PROJECTS_FILE, ensure_data
-from duckdns_natmap import DEFAULT_NATMAP, DEFAULT_TARGET_HOST, SETTINGS_FILE, TARGET_HOSTS, port, run_locked_mapping, save_access_address, target_endpoint
+from duckdns_natmap import DEFAULT_NATMAP, DEFAULT_TARGET_HOST, MAPPING_SCHEMES, RDP_PORT, SETTINGS_FILE, TARGET_HOSTS, port, run_locked_mapping, save_access_address, target_endpoint
 from pages_projects import CloudflareError, LOGIN_COMMAND, PAGES_HOST, PROJECT_NAME, PagesNameUnavailable, PagesProjects, WranglerLogin, cloudflare_request, discover_cloudflare_connections, project_token
 from platform_settings import AUTH_LABELS, PlatformProfile, PlatformSettings, pages_config, wrangler_login_status, write_json
 
 
 ADMIN_PORT = 8765
 ADMIN_URL = f"http://127.0.0.1:{ADMIN_PORT}/"
+REMOTE_LOOKUP_RETRY_SECONDS = 60
+PROJECT_SORT_MODES = ("custom", "name-asc", "name-desc")
 
 
 class ProjectInputError(ValueError):
@@ -59,6 +62,7 @@ class Project:
     entry: str = ""
     owner: str = ""
     target_host: str = DEFAULT_TARGET_HOST
+    rdp_lookup_ready: bool = False
 
     def __post_init__(self):
         if not PROJECT_NAME.fullmatch(self.slug):
@@ -75,13 +79,25 @@ class Project:
         if self.bind_port == ADMIN_PORT:
             raise ProjectInputError("bind_port", f"端口 {ADMIN_PORT} 正由本机管理页使用。")
         if self.target_port == self.bind_port:
-            raise ProjectInputError("bind_port", "NATMap 本地端口必须与网页端口不同。")
-        if self.scheme not in ("auto", "http", "https"):
-            raise ProjectInputError("scheme", "请选择自动检测、HTTP 或 HTTPS。")
+            raise ProjectInputError("bind_port", "NATMap 本地端口必须与服务端口不同。")
+        if self.scheme not in MAPPING_SCHEMES:
+            raise ProjectInputError("scheme", "请选择自动检测、HTTP、HTTPS 或 TCP。")
         if self.entry:
             host = urlsplit(self.entry).netloc
             if not PAGES_HOST.fullmatch(host) or self.entry != f"https://{host}":
                 raise ValueError("项目入口必须是有效的 HTTPS Pages 网址。")
+
+    @property
+    def ready(self):
+        return bool(self.entry) or self.scheme == "tcp"
+
+    @property
+    def supports_remote_lookup(self):
+        return bool(self.entry and self.owner) and self.target_port == RDP_PORT and self.scheme in ("auto", "tcp")
+
+    @property
+    def remote_link(self):
+        return f"{self.entry}/" if self.supports_remote_lookup and self.rdp_lookup_ready else ""
 
 
 @dataclass
@@ -96,6 +112,13 @@ class Task:
     detail: str = ""
     error_field: str = ""
     detected_scheme: str = ""
+
+
+@dataclass
+class RemoteLookup:
+    thread: Thread | None = None
+    retry_at: float = 0
+    error: str = ""
 
 
 class Manager:
@@ -122,15 +145,20 @@ class Manager:
             )
         self.projects = {}
         self.removed_owners = {}
+        self.sort_mode = "custom"
         if projects_file.is_file():
             records = json.loads(projects_file.read_text(encoding="utf-8"))
             if isinstance(records, dict):
                 self.removed_owners = dict(records.get("removed_owners", {}))
+                if records.get("sort_mode") in PROJECT_SORT_MODES:
+                    self.sort_mode = records["sort_mode"]
                 records = records["projects"]
             for data in records:
+                data.pop("rdp_lookup_key", None)
                 project = Project(**data)
                 self.projects[project.slug] = project
         self.tasks = {}
+        self.remote_lookups = {}
         self.lock = RLock()
         self.provision_lock = Lock()
         self.wrangler_login = WranglerLogin(self.configure_cloudflare)
@@ -188,13 +216,78 @@ class Manager:
             raise ValueError("settings.json 中缺少固定入口的更新令牌。")
         return project_token(token, project.slug) if project.owner else token
 
+    def prepare_remote_lookup(self, project):
+        with self.lock:
+            current = self.projects.get(project.slug)
+            if (self.closing.is_set() or not current or not current.supports_remote_lookup
+                or (current.entry, current.owner) != (project.entry, project.owner)):
+                return False
+            if current.remote_link:
+                return True
+            lookup = self.remote_lookups.setdefault(project.slug, RemoteLookup())
+            if lookup.thread is None and monotonic() >= lookup.retry_at:
+                lookup.error = ""
+                lookup.thread = Thread(target=self.deploy_remote_lookup, args=(project.slug, lookup),
+                                       name=f"natmap-remote-{project.slug}", daemon=True)
+                lookup.thread.start()
+            return False
+
+    def deploy_remote_lookup(self, slug, lookup):
+        try:
+            self.enable_remote_lookup(slug)
+        except (CloudflareError, OSError, ValueError, TypeError, KeyError) as error:
+            message = str(error) if isinstance(error, (CloudflareError, ValueError)) else "无法读取或保存外网链接配置。"
+            with self.lock:
+                lookup.error = message
+        finally:
+            with self.lock:
+                lookup.retry_at = monotonic() + REMOTE_LOOKUP_RETRY_SECONDS
+                lookup.thread = None
+
+    def enable_remote_lookup(self, slug):
+        with self.provision_lock:
+            with self.lock:
+                if self.closing.is_set():
+                    raise ValueError("管理页正在退出。")
+                project = self.project(slug)
+                if not project.supports_remote_lookup:
+                    raise ValueError("外网链接需要一个由管理页创建的 Pages 项目，服务端口为 3389。")
+                if project.remote_link:
+                    return project.remote_link
+                platform = self.platforms.selected()
+            PagesProjects(platform).deploy_remote_lookup(project.slug, project.entry, project.owner)
+            with self.lock:
+                current = self.project(slug)
+                if not current.supports_remote_lookup or (current.entry, current.owner) != (project.entry, project.owner):
+                    raise ValueError("项目配置已变化，外网链接等待下次同步。")
+                updated = replace(current, rdp_lookup_ready=True)
+                self.store(updated)
+                return updated.remote_link
+
     def store(self, project):
         self.save_projects({**self.projects, project.slug: project}, self.removed_owners)
 
-    def save_projects(self, records, removed_owners):
-        write_json(self.projects_file, {"projects": [asdict(row) for row in records.values()], "removed_owners": removed_owners})
+    def save_projects(self, records, removed_owners, *, sort_mode=None):
+        sort_mode = self.sort_mode if sort_mode is None else sort_mode
+        write_json(self.projects_file, {"projects": [asdict(row) for row in records.values()],
+                                        "removed_owners": removed_owners, "sort_mode": sort_mode})
         self.projects = records
         self.removed_owners = removed_owners
+        self.sort_mode = sort_mode
+
+    def sort_projects(self, mode, order=None):
+        if mode not in PROJECT_SORT_MODES or (order is not None and mode != "custom"):
+            raise ValueError("请选择有效的排序方式。")
+        with self.lock:
+            records = self.projects
+            if order is not None:
+                ready = {slug for slug, project in records.items() if project.ready}
+                if len(order) != len(ready) or set(order) != ready:
+                    raise ValueError("项目列表已变化，请刷新后重新调整顺序。")
+                ordered = iter(order)
+                slugs = (next(ordered) if project.ready else slug for slug, project in records.items())
+                records = {slug: self.projects[slug] for slug in slugs}
+            self.save_projects(records, self.removed_owners, sort_mode=mode)
 
     def project(self, slug):
         if slug not in self.projects:
@@ -212,27 +305,30 @@ class Manager:
             if project.slug == self.default_slug:
                 raise ProjectInputError("slug", "这是已有项目的子域名，请使用「导入已有项目」。")
             existing = self.projects.get(project.slug)
-            if existing and (existing.entry or not existing.owner):
+            if existing and (existing.ready or not existing.owner or project.scheme == "tcp"):
                 raise ProjectInputError("slug", "该子域名已添加，请换一个子域名。")
             if self.active(project.slug):
                 raise ProjectInputError("slug", "该项目正在创建，请稍候。")
 
-            platform = self.platforms.selected()
+            platform = self.platforms.selected() if project.scheme != "tcp" else None
             records = self.projects.copy()
             removed_owners = self.removed_owners.copy()
-            owner = existing.owner if existing else removed_owners.pop(project.slug, None) or token_urlsafe(24)
             previous = records.get(draft_slug)
-            if previous and draft_slug != project.slug and not previous.entry:
+            if previous and draft_slug != project.slug and not previous.ready:
                 if self.active(draft_slug):
                     raise ValueError("原项目正在创建，请等它完成后再更换子域名。")
                 records.pop(draft_slug)
                 if previous.owner:
                     removed_owners[draft_slug] = previous.owner
-            records[project.slug] = replace(project, owner=owner)
+            if platform is not None:
+                owner = existing.owner if existing else removed_owners.pop(project.slug, None) or token_urlsafe(24)
+                project = replace(project, owner=owner)
+            records[project.slug] = project
             self.save_projects(records, removed_owners)
             if previous and draft_slug not in records:
                 self.tasks.pop(draft_slug, None)
-            self.begin(project.slug, "provision", platform=platform)
+            if platform is not None:
+                self.begin(project.slug, "provision", platform=platform)
 
     def import_default(self):
         with self.lock:
@@ -253,14 +349,17 @@ class Manager:
                 removed_owners[slug] = project.owner
             self.save_projects(records, removed_owners)
             self.tasks.pop(slug, None)
+            self.remote_lookups.pop(slug, None)
 
     def edit(self, slug, name, target_port, bind_port, scheme, target_host=None):
         with self.lock:
             project = self.project(slug)
-            if not project.entry:
+            if not project.ready:
                 raise ValueError("请在新建项目表单中修改未完成的项目。")
             updated = replace(project, name=name, target_port=target_port, bind_port=bind_port, scheme=scheme,
                               target_host=project.target_host if target_host is None else target_host)
+            if not updated.ready:
+                raise ValueError("网页协议需要 Pages 入口。请新建一个网页项目。")
             task = self.tasks.get(slug)
             restart = self.active(slug) and task.phase in ("运行中", "正在重启") and not self.closing.is_set()
             if restart:
@@ -306,13 +405,13 @@ class Manager:
             project = self.project(slug)
             if self.active(slug):
                 raise ValueError("该任务正在运行，请稍候。")
-            if action == "provision" and (project.entry or not project.owner):
+            if action == "provision" and (project.ready or not project.owner):
                 raise ValueError("这个 Pages 项目已经创建。")
             if action == "provision" and platform is None:
                 platform = self.platforms.selected()
             bind_port = None
             if action == "mapping":
-                if not project.entry:
+                if not project.ready:
                     raise ValueError("请先创建 Pages 项目。")
                 try:
                     bind_port = self.mapping_port(project)
@@ -325,7 +424,7 @@ class Manager:
 
     def start_saved_projects(self):
         with self.lock:
-            projects = [project for project in self.projects.values() if project.entry]
+            projects = [project for project in self.projects.values() if project.ready]
         for project in projects:
             try:
                 with self.lock:
@@ -348,7 +447,7 @@ class Manager:
         def report(message):
             with self.lock:
                 task.logs.append(message)
-                if message.startswith(("等待本地网页服务 ", "本地端口 ")):
+                if message.startswith(("等待本地网页服务 ", "等待本地服务 ", "本地端口 ")):
                     task.detail = message
 
         def save_address(address):
@@ -394,10 +493,13 @@ class Manager:
             if not task.stop.is_set():
                 args = Namespace(target_host=project.target_host, target_port=project.target_port,
                                  bind_port=task.bind_port, scheme=project.scheme, system_proxy=False)
+                redirect = (project.entry, self.publish_token(project)) if project.entry else None
+
                 result = run_locked_mapping(
-                    args, str(DEFAULT_NATMAP), (project.entry, self.publish_token(project)),
+                    args, str(DEFAULT_NATMAP), redirect,
                     project="" if project.slug == self.default_slug else project.slug,
                     stop=task.stop, report=report, save_address=save_address, on_scheme=save_scheme,
+                    rdp_lookup_enabled=(lambda: self.prepare_remote_lookup(project)) if project.supports_remote_lookup else None,
                 )
             with self.lock:
                 if task.phase != "正在重启" or self.closing.is_set():
@@ -432,8 +534,15 @@ class Manager:
                 local_port = task.bind_port if busy and task.bind_port is not None else project.bind_port
                 running = task.project if busy and task.bind_port is not None else project
                 scheme_label = running.scheme.upper()
+                effective_scheme = running.scheme
                 if running.scheme == "auto":
-                    detected = task.detected_scheme if busy else ""
+                    detected = ""
+                    if task and (busy or (task.project.target_port == project.target_port
+                                          and task.project.target_host == project.target_host
+                                          and task.project.scheme == project.scheme
+                                          and task.detected_scheme == "tcp")):
+                        detected = task.detected_scheme
+                    effective_scheme = detected or running.scheme
                     scheme_label = f"{detected.upper()}（自动）" if detected else "自动检测"
                 changes_pending = (running.target_host, running.target_port, running.bind_port, running.scheme) != (
                     project.target_host, project.target_port, project.bind_port, project.scheme,
@@ -441,13 +550,30 @@ class Manager:
                 endpoint = running.target_port
                 if running.target_host != DEFAULT_TARGET_HOST:
                     endpoint = target_endpoint(running.target_host, running.target_port)
+                remote_mode = project.supports_remote_lookup and effective_scheme in ("auto", "tcp")
+                fixed_link = project.remote_link if remote_mode else (
+                    project.entry + "/" if project.entry and effective_scheme != "tcp" else ""
+                )
+                lookup = self.remote_lookups.get(project.slug)
+                lookup_status = ""
+                lookup_error = ""
+                if remote_mode and not fixed_link:
+                    lookup_status = "等待映射"
+                    if lookup and lookup.thread:
+                        lookup_status = "正在部署"
+                    elif lookup and lookup.error:
+                        lookup_status = "等待重试"
+                        lookup_error = lookup.error
                 rows.append({"slug": project.slug, "name": project.name, "target_port": project.target_port,
                              "target_host": project.target_host, "display_target_port": running.target_port,
                              "display_target_endpoint": endpoint, "changes_pending": changes_pending,
                              "bind_port": project.bind_port, "local_port": local_port, "scheme": project.scheme,
-                             "scheme_label": scheme_label,
-                             "entry": project.entry, "busy": busy,
-                             "phase": task.phase if task else ("待运行" if project.entry else "待创建"),
+                             "scheme_label": scheme_label, "rdp": effective_scheme == "tcp" and running.target_port == RDP_PORT,
+                             "show_entry": bool(fixed_link), "fixed_link": fixed_link, "remote_link": project.remote_link,
+                             "supports_remote_lookup": remote_mode, "remote_lookup_status": lookup_status,
+                             "remote_lookup_error": lookup_error,
+                             "entry": project.entry, "ready": project.ready, "busy": busy,
+                             "phase": task.phase if task else ("待运行" if project.ready else "待创建"),
                              "detail": task.detail if task else "", "error_field": task.error_field if task else "",
                              "logs": "\n".join(task.logs) if task else ""})
             return rows
@@ -490,8 +616,8 @@ def create_app(manager):
 
     def render_dashboard(edit_issue=None, *, open_create=False, draft_slug=None, values=None, issue=None):
         rows = manager.snapshot()
-        projects = [row for row in rows if row["entry"]]
-        drafts = [row for row in rows if not row["entry"]]
+        projects = [row for row in rows if row["ready"]]
+        drafts = [row for row in rows if not row["ready"]]
         draft = next((row for row in drafts if row["slug"] == draft_slug), None)
         if draft and issue is None and draft["phase"] == "创建失败":
             issue = {"field": draft["error_field"] or "form", "message": draft["detail"]}
@@ -502,7 +628,7 @@ def create_app(manager):
         )
         return render_template(
             "natmap.html", projects=projects, drafts=drafts,
-            can_import=can_import, csrf=csrf_token(), edit_issue=edit_issue,
+            can_import=can_import, csrf=csrf_token(), edit_issue=edit_issue, sort_mode=manager.sort_mode,
             open_create=open_create, draft=draft, values=values or draft or {"scheme": "auto"}, issue=issue,
         )
 
@@ -516,7 +642,7 @@ def create_app(manager):
     @app.get("/project/new")
     def new_project():
         draft_slug = request.args.get("draft")
-        if draft_slug and any(row["slug"] == draft_slug and row["entry"] for row in manager.snapshot()):
+        if draft_slug and any(row["slug"] == draft_slug and row["ready"] for row in manager.snapshot()):
             return redirect(url_for("index", _anchor=f"project-{draft_slug}"))
         return render_dashboard(open_create=True, draft_slug=draft_slug)
 
@@ -599,7 +725,8 @@ def create_app(manager):
         values["scheme"] = request.form.get("scheme", "auto")
         previous = request.form.get("draft", "")
         try:
-            project = Project(values["slug"].strip().lower(), **project_settings(values))
+            slug = f"tcp-{token_hex(8)}" if values["scheme"] == "tcp" else values["slug"].strip().lower()
+            project = Project(slug, **project_settings(values))
             manager.create(project, previous)
         except ValueError as error:
             issue = {"field": getattr(error, "field", "form"), "message": str(error)}
@@ -612,7 +739,7 @@ def create_app(manager):
                 return jsonify(issue), 500
             return render_dashboard(open_create=True, draft_slug=previous, values=values, issue=issue), 500
         if wants_json:
-            return jsonify(draft=project.slug), 202
+            return jsonify(draft=project.slug), 201 if project.scheme == "tcp" else 202
         return redirect(url_for("new_project", draft=project.slug), code=303)
 
     @app.post("/project/save")
@@ -640,6 +767,18 @@ def create_app(manager):
             return jsonify(name=values["name"].strip(), message=message)
         flash(message)
         return redirect(url_for("index", _anchor=f"project-{slug}"), code=303)
+
+    @app.post("/project/sort")
+    def sort_projects():
+        mode = request.form.get("mode", "")
+        order = request.form.getlist("order") if "order" in request.form else None
+        try:
+            manager.sort_projects(mode, order)
+        except ValueError as error:
+            return jsonify(message=str(error)), 422
+        except OSError:
+            return jsonify(message="无法保存排序，请检查本机项目配置。"), 500
+        return jsonify(mode=mode)
 
     @app.post("/project/<action>")
     def change(action):

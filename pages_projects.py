@@ -412,6 +412,51 @@ class PagesProjects:
             raise CloudflareError("无法确认临时项目仍为空项目。")
         self.api(token, f"/{name}", method="DELETE", missing_ok=True)
 
+    def deploy(self, name, owner_id, branch):
+        public_vars = {"NATMAP_PROJECT": name, "NATMAP_MANAGER_ID": owner_id}
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix="natmap-pages-", dir=TEMP_DIR) as directory:
+            folder = Path(directory)
+            shutil.copytree(PAGES_DIR / "public", folder / "public")
+            config = {**self.config, "name": name, "vars": public_vars, "pages_build_output_dir": "./public"}
+            (folder / "wrangler.jsonc").write_text(json.dumps(config, indent=2), encoding="utf-8")
+            result = self.wrangler("pages", "deploy", "--project-name", name, "--branch", branch, cwd=folder)
+        if result.returncode:
+            raise CloudflareError("Pages 部署未成功。请检查 Cloudflare 登录和网络，然后重试。")
+
+    def matches_deployment(self, project, host, owner_id):
+        production = (project.get("deployment_configs") or {}).get("production") or {}
+        env_vars = production.get("env_vars") or {}
+        database = (production.get("d1_databases") or {}).get("REDIRECT_DB") or {}
+        return (
+            project.get("subdomain") == host and has_project_owner(project, owner_id)
+            and (env_vars.get("REDIRECT_TOKEN") or {}).get("type") == "secret_text"
+            and (database.get("id") or database.get("database_id")) == self.platform.database_id
+        )
+
+    def deploy_remote_lookup(self, name, entry, owner_id):
+        token = self.token()
+        project = self.api(token, f"/{name}", missing_ok=True)
+        host = urlsplit(entry).netloc
+        if not project or not self.matches_deployment(project, host, owner_id):
+            raise CloudflareError("无法确认项目归属和 D1 绑定。请在平台配置中选中该项目原来的 Cloudflare 连接。")
+        if project.get("production_branch") != "main":
+            raise CloudflareError("这个 Pages 项目的生产分支已变更，请在 Cloudflare 中检查项目配置。")
+        if self.remote_lookup_deployed(entry):
+            return
+        self.deploy(name, owner_id, "main")
+        if not self.matches_deployment(self.api(self.token(), f"/{name}"), host, owner_id):
+            raise CloudflareError("外网链接部署后校验失败，请重试。")
+
+    @staticmethod
+    def remote_lookup_deployed(entry):
+        request = Request(f"{entry}/remote/", method="HEAD", headers={"User-Agent": "NATMap-Manager/1.0"})
+        try:
+            with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
+                return response.headers.get("X-NATMap-Remote-Version") == "3"
+        except (OSError, ValueError):
+            return False
+
     def provision(self, name, owner_id, redirect_token):
         if not PROJECT_NAME.fullmatch(name):
             raise ValueError("无效的 Pages 项目名称。")
@@ -445,26 +490,9 @@ class PagesProjects:
             raise PagesNameUnavailable(message)
 
         self.prepare_database(token)
-        TEMP_DIR.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(prefix="natmap-pages-", dir=TEMP_DIR) as directory:
-            folder = Path(directory)
-            assets = folder / "public"
-            assets.mkdir()
-            shutil.copyfile(PAGES_DIR / "public/_worker.js", assets / "_worker.js")
-            config = {**self.config, "name": name, "vars": public_vars, "pages_build_output_dir": "./public"}
-            (folder / "wrangler.jsonc").write_text(json.dumps(config, indent=2), encoding="utf-8")
-            result = self.wrangler("pages", "deploy", "--project-name", name, "--branch", "main", cwd=folder)
-        if result.returncode:
-            raise CloudflareError("Pages 部署未成功。请检查 Cloudflare 登录和网络，然后重试。")
+        self.deploy(name, owner_id, "main")
 
         deployed = self.api(self.token(), f"/{name}")
-        host = deployed.get("subdomain", "")
-        production = deployed["deployment_configs"]["production"]
-        env_vars = production.get("env_vars") or {}
-        database = (production.get("d1_databases") or {}).get("REDIRECT_DB") or {}
-        if (host != expected_host
-            or not has_project_owner(deployed, owner_id)
-            or (env_vars.get("REDIRECT_TOKEN") or {}).get("type") != "secret_text"
-            or (database.get("id") or database.get("database_id")) != self.platform.database_id):
+        if not self.matches_deployment(deployed, expected_host, owner_id):
             raise CloudflareError("Pages 配置校验失败，请重试创建。")
-        return f"https://{host}"
+        return f"https://{expected_host}"

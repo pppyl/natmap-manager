@@ -16,22 +16,22 @@
           <input name="name" maxlength="60" placeholder="如「项目面板」" value="{{ values.name | default('') }}" {{ issue_attributes('name') }} required autofocus>
           {{ create_issue('name') }}
         </label>
-        <label>独立子域名
-          <span class="suffix"><input name="slug" pattern="[a-z0-9]([a-z0-9\x2D]{0,38}[a-z0-9])?" maxlength="40" placeholder="workbench" value="{{ values.slug | default('') }}" {{ issue_attributes('slug') }} required><span>.pages.dev</span></span>
+        <label data-create-entry{% if values.scheme == 'tcp' %} hidden{% endif %}>独立子域名
+          <span class="suffix"><input name="slug" pattern="[a-z0-9]([a-z0-9\x2D]{0,38}[a-z0-9])?" maxlength="40" placeholder="workbench" value="{{ values.slug | default('') }}" {{ issue_attributes('slug') }}{% if values.scheme == 'tcp' %} disabled{% else %} required{% endif %}><span>.pages.dev</span></span>
           {{ create_issue('slug') }}
         </label>
-        <label>网页端口
-          <input type="number" name="target_port" min="1" max="65535" placeholder="5000" value="{{ values.target_port | default('') }}" {{ issue_attributes('target_port') }} required>
+        <label>服务端口
+          <input type="number" name="target_port" min="1" max="65535" placeholder="{{ '3389' if values.scheme == 'tcp' else '5000' }}" value="{{ values.target_port | default('') }}" {{ issue_attributes('target_port') }} required>
           {{ create_issue('target_port') }}
         </label>
-        <details class="advanced-settings"{% if values.target_host == '::1' or values.bind_port or values.scheme in ('http', 'https') or (issue and issue.field in ('target_host', 'bind_port', 'scheme')) %} open{% endif %}>
+        <details class="advanced-settings"{% if values.target_host == '::1' or values.bind_port or values.scheme in ('http', 'https', 'tcp') or (issue and issue.field in ('target_host', 'bind_port', 'scheme')) %} open{% endif %}>
           <summary>高级设置</summary>
           <div class="advanced-fields">
-            <label>网页监听地址
+            <label>服务监听地址
               <select name="target_host" {{ issue_attributes('target_host') }}>{{ target_host_options(values.target_host) }}</select>
               {{ create_issue('target_host') }}
             </label>
-            <label>本地网页协议
+            <label>本地协议
               <select name="scheme" {{ issue_attributes('scheme') }}>{{ scheme_options(values.scheme) }}</select>
               {{ create_issue('scheme') }}
             </label>

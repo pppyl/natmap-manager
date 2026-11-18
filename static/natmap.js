@@ -2,6 +2,10 @@ const projectsBySlug = new Map();
 const createForm = document.querySelector("[data-create-form]");
 const createDialog = document.querySelector("[data-create-dialog]");
 const dashboard = document.querySelector("[data-project-dashboard]");
+const projectTable = dashboard?.querySelector(".project-table");
+const sortForm = dashboard?.querySelector("[data-project-sort]");
+const sortSelect = sortForm?.elements.namedItem("mode");
+const projectNames = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
 const projectEditor = document.querySelector("[data-project-editor]");
 const editorPanel = projectEditor?.querySelector("[data-editor-panel]");
 const editorMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -11,6 +15,10 @@ let editorPosition = 0;
 let editorVelocity = 0;
 let editorFrame = 0;
 let editNoticeTimer;
+let customProjectOrder = [];
+let projectSortMode = sortSelect?.value || "custom";
+let editingProjectOrder = false;
+let savingProjectOrder = false;
 
 async function copyAddress(value) {
   try {
@@ -37,7 +45,6 @@ async function copyAddress(value) {
 }
 
 function bindCopyButton(button) {
-  const label = button.dataset.addressLabel;
   let resetTimer;
   button.addEventListener("click", async () => {
     const address = button.dataset.copyAddress;
@@ -51,17 +58,26 @@ function bindCopyButton(button) {
     if (button.dataset.copyAddress !== address) return;
 
     button.textContent = message;
-    button.setAttribute("aria-label", `${label}${message}`);
+    button.setAttribute("aria-label", `${button.dataset.addressLabel}${message}`);
     window.clearTimeout(resetTimer);
     resetTimer = window.setTimeout(() => {
       button.textContent = "复制";
-      button.setAttribute("aria-label", `复制${label}`);
+      button.setAttribute("aria-label", `复制${button.dataset.addressLabel}`);
     }, 2000);
   });
 }
 
+function setCopyAddress(button, address, label = button.dataset.addressLabel) {
+  if (button.dataset.copyAddress === address && button.dataset.addressLabel === label) return;
+  button.dataset.copyAddress = address;
+  button.dataset.addressLabel = label;
+  button.textContent = "复制";
+  button.setAttribute("aria-label", `复制${label}`);
+}
+
 function mappingStatus(text) {
   if (text.startsWith("等待本地网页服务")) return "等待网页";
+  if (text.startsWith("等待本地服务")) return "等待服务";
   if (text.startsWith("本地端口")) return "检测协议";
   if (text.startsWith("NATMap 正在重连")) return "正在重连";
   if (text.startsWith("固定入口更新暂未确认")) return "入口待重试";
@@ -77,27 +93,37 @@ function renderConnection(row, panel, text) {
   phase.toggleAttribute("data-waiting", label !== phase.dataset.state);
 
   const detail = panel.querySelector("[data-detail]") || row.querySelector("[data-detail]");
-  if (detail.dataset.detailText === text) return;
+  const rdp = row.hasAttribute("data-rdp");
+  if (detail.dataset.detailText === text && detail.dataset.rdp === String(rdp)) return;
   detail.dataset.detailText = text;
+  detail.dataset.rdp = String(rdp);
   const direct = row.querySelector("[data-direct-address]");
   const lines = text.split("\n").filter(Boolean);
 
   if (direct) {
-    const address = lines.find(line => /^直连地址\s+https?:\/\/\S+$/.test(line))?.replace(/^直连地址\s+/, "") || "";
+    const address = lines.find(line => /^直连地址\s+\S+$/.test(line))?.replace(/^直连地址\s+/, "") || "";
     direct.hidden = !address;
     row.querySelector("[data-direct-empty]").hidden = Boolean(address);
     const link = direct.querySelector("[data-direct-link]");
-    if (address) link.href = address;
+    const web = /^https?:\/\//.test(address);
+    const command = rdp && /^\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}$/.test(address) ? `mstsc /v:${address}` : "";
+    if (web) link.href = address;
     else link.removeAttribute("href");
-    link.title = address;
-    link.textContent = address;
-    const button = direct.querySelector("[data-copy-address]");
-    if (button.dataset.copyAddress !== address) {
-      button.dataset.copyAddress = address;
-      button.textContent = "复制";
-      button.setAttribute("aria-label", "复制直连地址");
+    link.title = command || address;
+    link.toggleAttribute("data-rdp-link", Boolean(command));
+    if (command) {
+      const endpoint = document.createElement("span");
+      endpoint.textContent = address;
+      link.replaceChildren("mstsc /v:", endpoint);
+    } else link.textContent = address;
+    setCopyAddress(direct.querySelector("[data-copy-address]"), command || address, command ? "远程桌面命令" : "直连地址");
+    const commandPanel = panel.querySelector("[data-rdp-command]");
+    if (commandPanel) {
+      commandPanel.hidden = !command;
+      commandPanel.querySelector("[data-rdp-command-text]").textContent = command;
+      setCopyAddress(commandPanel.querySelector("[data-copy-address]"), command);
     }
-    detail.textContent = lines.filter(line => !/^(固定入口|直连地址)\s+https?:\/\/\S+$/.test(line)).join("\n");
+    detail.textContent = lines.filter(line => !/^(固定入口|直连地址)\s+\S+$/.test(line)).join("\n");
     detail.hidden = !detail.textContent;
     return;
   }
@@ -249,17 +275,122 @@ async function saveProjectEditor(event) {
     name.textContent = result.name;
     name.title = result.name;
     project.panel.querySelector("[data-editor-project]").textContent = result.name;
-    const notice = document.querySelector("[data-edit-notice]");
-    notice.textContent = result.message;
-    notice.hidden = false;
-    window.clearTimeout(editNoticeTimer);
-    editNoticeTimer = window.setTimeout(() => { notice.hidden = true; }, 5000);
+    displayProjectOrder();
+    showProjectNotice(result.message);
   } catch {
     error.textContent = "无法保存配置，请重试。";
     error.hidden = false;
   } finally {
     submit.disabled = false;
   }
+}
+
+function showProjectNotice(message) {
+  const notice = dashboard.querySelector("[data-edit-notice]");
+  notice.textContent = message;
+  notice.hidden = false;
+  window.clearTimeout(editNoticeTimer);
+  editNoticeTimer = window.setTimeout(() => { notice.hidden = true; }, 5000);
+}
+
+function displayProjectOrder() {
+  if (!sortForm || editingProjectOrder) return;
+  const rows = customProjectOrder.map(slug => projectsBySlug.get(slug).row);
+  const heading = projectTable.querySelector("[data-name-heading]");
+  if (projectSortMode === "custom") {
+    heading.removeAttribute("aria-sort");
+  } else {
+    const ascending = projectSortMode === "name-asc";
+    heading.setAttribute("aria-sort", ascending ? "ascending" : "descending");
+    rows.sort((first, second) => {
+      const firstName = first.querySelector("[data-project-name]").textContent;
+      const secondName = second.querySelector("[data-project-name]").textContent;
+      return projectNames.compare(firstName, secondName) * (ascending ? 1 : -1);
+    });
+  }
+  const groups = rows.map(row => row.closest("tbody"));
+  if (groups.some((group, index) => projectTable.tBodies[index] !== group)) {
+    projectTable.append(...groups);
+  }
+}
+
+function updateProjectOrderControls() {
+  if (!sortForm) return;
+  const groups = Array.from(projectTable.tBodies);
+  sortForm.hidden = groups.length < 2;
+  sortSelect.disabled = editingProjectOrder || savingProjectOrder;
+  const edit = sortForm.querySelector("[data-edit-order]");
+  edit.hidden = projectSortMode !== "custom" || editingProjectOrder;
+  edit.disabled = savingProjectOrder;
+  for (const name of ["save", "cancel"]) {
+    const button = sortForm.querySelector(`[data-${name}-order]`);
+    button.hidden = !editingProjectOrder;
+    button.disabled = savingProjectOrder;
+  }
+  groups.forEach((group, index) => {
+    const controls = group.querySelector("[data-order-controls]");
+    controls.hidden = !editingProjectOrder;
+    controls.querySelector('[data-move-project="up"]').disabled = savingProjectOrder || index === 0;
+    controls.querySelector('[data-move-project="down"]').disabled = savingProjectOrder || index === groups.length - 1;
+  });
+}
+
+function editProjectOrder(editing) {
+  editingProjectOrder = editing;
+  dashboard.querySelector("[data-sort-error]").hidden = true;
+  displayProjectOrder();
+  updateProjectOrderControls();
+  const focus = editing
+    ? projectTable.querySelector("[data-move-project]:enabled")
+    : sortForm.querySelector("[data-edit-order]");
+  focus?.focus({ preventScroll: true });
+}
+
+async function saveProjectOrder(mode, order) {
+  if (savingProjectOrder) return;
+  savingProjectOrder = true;
+  const error = dashboard.querySelector("[data-sort-error]");
+  error.hidden = true;
+  updateProjectOrderControls();
+  const body = new URLSearchParams({ csrf: sortForm.elements.namedItem("csrf").value, mode });
+  order?.forEach(slug => body.append("order", slug));
+  try {
+    const response = await fetch(sortForm.action, { method: "POST", body });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.message || "无法保存排序，请重试。");
+    projectSortMode = result.mode;
+    if (order) {
+      customProjectOrder = [...order, ...customProjectOrder.filter(slug => !order.includes(slug))];
+      editingProjectOrder = false;
+      showProjectNotice("项目顺序已保存。");
+    }
+    displayProjectOrder();
+  } catch (failure) {
+    error.textContent = failure.message || "无法保存排序，请重试。";
+    error.hidden = false;
+  } finally {
+    savingProjectOrder = false;
+    sortSelect.value = projectSortMode;
+    updateProjectOrderControls();
+    if (order && !editingProjectOrder) sortForm.querySelector("[data-edit-order]").focus({ preventScroll: true });
+  }
+}
+
+function showRemoteLink(panel, link) {
+  const remote = panel.querySelector("[data-remote-link]");
+  if (!remote) return;
+  remote.hidden = !link;
+  if (link) {
+    remote.querySelector("a").href = link;
+    setCopyAddress(remote.querySelector("[data-copy-address]"), link);
+  }
+}
+
+function showLookupStatus(element, message) {
+  if (!element) return;
+  const text = message || "";
+  if (element.textContent !== text) element.textContent = text;
+  element.hidden = !text;
 }
 
 function bindProjectRow(row) {
@@ -270,12 +401,38 @@ function bindProjectRow(row) {
     else openProjectEditor(toggle);
   });
   projectsBySlug.set(row.dataset.project, { row, panel });
+  customProjectOrder.push(row.dataset.project);
   row.querySelectorAll("[data-copy-address]").forEach(bindCopyButton);
+  if (panel !== row) panel.querySelectorAll("[data-copy-address]").forEach(bindCopyButton);
   const detail = panel.querySelector("[data-detail]") || row.querySelector("[data-detail]");
   renderConnection(row, panel, detail.textContent);
 }
 
 document.querySelectorAll("[data-project]").forEach(bindProjectRow);
+
+if (sortForm) {
+  displayProjectOrder();
+  updateProjectOrderControls();
+  sortSelect.addEventListener("change", () => saveProjectOrder(sortSelect.value));
+  sortForm.querySelector("[data-edit-order]").addEventListener("click", () => editProjectOrder(true));
+  sortForm.querySelector("[data-cancel-order]").addEventListener("click", () => editProjectOrder(false));
+  sortForm.addEventListener("submit", event => {
+    event.preventDefault();
+    if (!editingProjectOrder) return;
+    const order = Array.from(projectTable.tBodies, group => group.rows[0].dataset.project);
+    saveProjectOrder("custom", order);
+  });
+  projectTable.addEventListener("click", event => {
+    const button = event.target.closest("[data-move-project]");
+    if (!button || button.disabled || !editingProjectOrder || savingProjectOrder) return;
+    const group = button.closest("tbody");
+    if (button.dataset.moveProject === "up") projectTable.insertBefore(group, group.previousElementSibling);
+    else projectTable.insertBefore(group.nextElementSibling, group);
+    updateProjectOrderControls();
+    const focus = button.disabled ? group.querySelector("[data-move-project]:enabled") : button;
+    focus?.focus({ preventScroll: true });
+  });
+}
 
 if (projectEditor) {
   projectEditor.addEventListener("click", event => {
@@ -331,7 +488,20 @@ function setDraftSlug(slug) {
   createForm.elements.namedItem("draft").value = slug;
 }
 
+function syncCreateProtocol() {
+  const entry = createForm.querySelector("[data-create-entry]");
+  if (!entry) return;
+  const tcp = createForm.elements.namedItem("scheme").value === "tcp";
+  const slug = createForm.elements.namedItem("slug");
+  entry.hidden = tcp;
+  slug.required = !tcp;
+  slug.disabled = tcp;
+  createForm.elements.namedItem("target_port").placeholder = tcp ? "3389" : "5000";
+}
+
 if (createDialog) {
+  syncCreateProtocol();
+  createForm.elements.namedItem("scheme").addEventListener("change", syncCreateProtocol);
   const open = document.querySelector("[data-open-create]");
   open.addEventListener("click", event => {
     if (event.button || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
@@ -393,13 +563,15 @@ async function refreshProjectList(slug) {
   list.hidden = false;
   document.querySelector("[data-empty-projects]").hidden = true;
   bindProjectRow(row);
+  displayProjectOrder();
+  updateProjectOrderControls();
 }
 
 async function updateCreateForm(projects) {
   if (submittingProject || !createForm?.hasAttribute("data-pending")) return;
   const draft = projects.find(project => project.slug === createForm.dataset.draft);
   if (!draft || draft.busy) return;
-  if (draft?.entry) {
+  if (draft.ready ?? Boolean(draft.entry)) {
     if (!createDialog) {
       if (createForm.dataset.returnUrl) window.location.replace(createForm.dataset.returnUrl);
       else window.location.reload();
@@ -409,13 +581,14 @@ async function updateCreateForm(projects) {
     setDraftSlug("");
     for (const name of ["name", "slug", "target_port", "bind_port"]) createForm.elements.namedItem(name).value = "";
     createForm.elements.namedItem("scheme").value = "auto";
+    syncCreateProtocol();
     const host = createForm.elements.namedItem("target_host");
     if (host) host.selectedIndex = 0;
     createForm.querySelector(".advanced-settings").open = false;
     setCreatePending(false);
     if (createDialog.open) {
       createDialog.close();
-      projectsBySlug.get(draft.slug).row.querySelector(".entry").focus();
+      projectsBySlug.get(draft.slug).row.querySelector("[data-run]").focus();
     }
     return;
   }
@@ -444,6 +617,39 @@ async function updateStatus() {
       row.querySelector("[data-local-port]").textContent = project.local_port ?? "自动分配";
       const scheme = row.querySelector("[data-scheme]");
       if (scheme) scheme.title = scheme.textContent = project.scheme_label ?? project.scheme.toUpperCase();
+      row.toggleAttribute("data-rdp", Boolean(project.rdp));
+      const remoteLink = project.remote_link ? new URL("/", project.remote_link).href : "";
+      const fixedLink = remoteLink && project.fixed_link === project.remote_link ? remoteLink : project.fixed_link;
+      const fixed = row.querySelector("[data-fixed-entry]");
+      if (fixed) {
+        const link = fixed.querySelector("a");
+        const button = fixed.querySelector("[data-copy-address]");
+        const pending = fixed.querySelector("[data-fixed-pending]");
+        if (!pending) {
+          fixed.hidden = !(project.show_entry ?? (project.scheme !== "tcp"));
+          const empty = row.querySelector("[data-fixed-empty]");
+          if (empty) empty.hidden = !fixed.hidden;
+        }
+        if (fixedLink) {
+          link.href = fixedLink;
+          link.title = project.supports_remote_lookup ? "打开远程桌面页" : fixedLink;
+          setCopyAddress(button, fixedLink);
+        } else if (pending) {
+          link.removeAttribute("href");
+          link.removeAttribute("title");
+        }
+        if (pending) {
+          button.hidden = !fixedLink;
+          showLookupStatus(pending, project.remote_lookup_status);
+        }
+      }
+      const lookup = panel.querySelector("[data-remote-lookup]");
+      if (lookup) {
+        lookup.hidden = !project.supports_remote_lookup;
+        showRemoteLink(panel, remoteLink);
+        showLookupStatus(lookup.querySelector("[data-remote-link-status]"), project.remote_lookup_status);
+        showLookupStatus(lookup.querySelector("[data-remote-link-error]"), project.remote_lookup_error);
+      }
       const pending = panel.querySelector("[data-changes-pending]") || row.querySelector("[data-changes-pending]");
       if (pending) pending.hidden = !project.changes_pending || project.phase === "正在重启";
       renderConnection(row, panel, project.detail || "");

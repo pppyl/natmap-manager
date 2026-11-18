@@ -8,15 +8,33 @@
           <h2 id="manage-name-{{ project.slug }}" data-editor-project>{{ project.name }}</h2>
           <button type="button" class="secondary" data-close-editor>收起</button>
         </div>
+        <section class="rdp-command" data-rdp-command hidden>
+          <h3>远程桌面连接命令</h3>
+          <div class="address-with-copy">
+            <code data-rdp-command-text></code>
+            <button type="button" class="copy-address" data-copy-address="" data-address-label="远程桌面命令" aria-label="复制远程桌面命令" aria-live="polite">复制</button>
+          </div>
+        </section>
+        {% if project.entry %}
+          <section class="rdp-command" data-remote-lookup{% if not project.supports_remote_lookup %} hidden{% endif %}>
+            <h3>外网链接</h3>
+            <div class="actions" data-remote-link{% if not project.remote_link %} hidden{% endif %}>
+              <a class="entry" href="{{ project.remote_link }}" target="_blank" rel="noopener noreferrer">打开远程桌面页</a>
+              <button type="button" class="copy-address" data-copy-address="{{ project.remote_link }}" data-address-label="外网链接" aria-label="复制外网链接" aria-live="polite">复制</button>
+            </div>
+            <p class="hint" data-remote-link-status{% if not project.remote_lookup_status %} hidden{% endif %}>{{ project.remote_lookup_status }}</p>
+            <p class="form-error" data-remote-link-error role="status"{% if not project.remote_lookup_error %} hidden{% endif %}>{{ project.remote_lookup_error }}</p>
+          </section>
+        {% endif %}
         <h3>修改配置</h3>
         <form method="post" action="{{ url_for('save_project', _anchor='project-' ~ project.slug) }}" data-edit-form>
           <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="slug" value="{{ project.slug }}">
           <div class="edit-grid">
             <label>项目名称<input name="name" value="{{ fields.name }}" maxlength="60" required></label>
-            <label>网页监听地址<select name="target_host">{{ target_host_options(fields.target_host or project.target_host) }}</select></label>
-            <label>网页端口<input type="number" name="target_port" min="1" max="65535" value="{{ fields.target_port }}" required></label>
+            <label>服务监听地址<select name="target_host">{{ target_host_options(fields.target_host or project.target_host) }}</select></label>
+            <label>服务端口<input type="number" name="target_port" min="1" max="65535" value="{{ fields.target_port }}" required></label>
             <label>NATMap 本地端口（选填）<input type="number" name="bind_port" min="1" max="65535" value="{{ fields.bind_port if fields.bind_port is not none else '' }}" placeholder="留空自动分配"></label>
-            <label>本地网页协议<select name="scheme">{{ scheme_options(fields.scheme) }}</select></label>
+            <label>本地协议<select name="scheme">{{ scheme_options(fields.scheme, allow_web=project.entry) }}</select></label>
           </div>
           <p class="form-error" data-edit-error role="alert"{% if not edit_open %} hidden{% endif %}>{{ edit_issue.message if edit_open else '' }}</p>
           <button type="submit" class="primary">保存配置</button>
@@ -24,7 +42,7 @@
 
         <section class="project-more" aria-labelledby="manage-logs-{{ project.slug }}">
           <h3 id="manage-logs-{{ project.slug }}">运行日志</h3>
-          {% if project.entry != ('https://' ~ project.slug ~ '.pages.dev') %}
+          {% if project.entry and project.entry != ('https://' ~ project.slug ~ '.pages.dev') %}
             <p class="hint project-detail">申请的子域名为 {{ project.slug }}.pages.dev</p>
           {% endif %}
           <p class="configuration-note" data-changes-pending role="status"{% if not project.changes_pending or project.phase == '正在重启' %} hidden{% endif %}>本地地址、端口或协议将在下次运行时生效。</p>

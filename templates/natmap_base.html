@@ -1,7 +1,9 @@
 <!doctype html>
-{%- macro scheme_options(selected) -%}
-  {% for value, label in [('auto', '自动检测'), ('http', 'HTTP'), ('https', 'HTTPS')] %}
-    <option value="{{ value }}"{% if selected == value %} selected{% endif %}>{{ label }}</option>
+{%- macro scheme_options(selected, allow_web=true) -%}
+  {% for value, label in [('auto', '自动检测'), ('http', 'HTTP'), ('https', 'HTTPS'), ('tcp', 'TCP（远程桌面等）')] %}
+    {% if allow_web or value == 'tcp' %}
+      <option value="{{ value }}"{% if selected == value %} selected{% endif %}>{{ label }}</option>
+    {% endif %}
   {% endfor %}
 {%- endmacro %}
 {%- macro target_host_options(selected) -%}
