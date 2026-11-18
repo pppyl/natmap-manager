@@ -17,11 +17,15 @@ from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 import webbrowser
 
-from data_storage import TEMP_DIR, WRANGLER_CACHE_DIR, WRANGLER_CONFIG_DIR
+from data_storage import TEMP_DIR, WRANGLER_CACHE_DIR, WRANGLER_CONFIG_DIR, WRANGLER_RUNTIME_DIR
 from platform_settings import PAGES_DIR, default_platform, pages_config, read_wrangler_profile
 
 
 WRANGLER_VERSION = "4.162.0"
+WRANGLER_PREPARE_TIMEOUT = 60
+WRANGLER_LINK_TIMEOUT = 90
+WRANGLER_AUTH_TIMEOUT = 300
+WRANGLER_SPEC_DIR = Path(__file__).parent / "tools" / "wrangler"
 PROJECT_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?\Z")
 PAGES_HOST = re.compile(r"[a-z0-9-]+\.pages\.dev\Z")
 
@@ -34,7 +38,7 @@ LOGIN_COMMAND = (
     f"$env:XDG_CONFIG_HOME = {powershell_path(WRANGLER_CONFIG_DIR)}\n"
     f"$env:XDG_CACHE_HOME = {powershell_path(WRANGLER_CACHE_DIR)}\n"
     "$env:CLOUDFLARE_AUTH_USE_KEYRING = 'false'\n"
-    f"npx.cmd --yes wrangler@{WRANGLER_VERSION} login "
+    f"npx.cmd --yes --prefer-offline wrangler@{WRANGLER_VERSION} login "
     "--scopes user:read account:read pages:write d1:write"
 )
 
@@ -64,13 +68,51 @@ def wrangler_environment():
     return environment
 
 
+def wrangler_command(npx, *args, offline=False):
+    cli = WRANGLER_RUNTIME_DIR / "node_modules" / "wrangler" / "bin" / "wrangler.js"
+    if cli.is_file():
+        try:
+            prepared = (WRANGLER_RUNTIME_DIR / ".ready").read_text(encoding="utf-8").strip() == WRANGLER_VERSION
+        except OSError:
+            prepared = False
+        node = shutil.which("node.exe") if prepared else None
+        if node:
+            return [node, str(cli), *args]
+    flags = ["--yes", "--prefer-offline"]
+    if offline:
+        flags.append("--offline")
+    return [npx, *flags, f"wrangler@{WRANGLER_VERSION}", *args]
+
+
+def stop_wrangler(process):
+    if process is None or process.poll() is not None:
+        return
+    try:
+        subprocess.run(
+            ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def run_wrangler(*args, environment=None, cwd=None):
     npx = shutil.which("npx.cmd")
     if not npx:
         raise CloudflareError("创建 Pages 项目需要 Node.js 和 npx.cmd。")
     try:
         return subprocess.run(
-            [npx, "--yes", f"wrangler@{WRANGLER_VERSION}", *args], cwd=cwd,
+            wrangler_command(npx, *args), cwd=cwd,
             env=environment if environment is not None else wrangler_environment(),
             stdin=subprocess.DEVNULL, capture_output=True, timeout=120,
             creationflags=subprocess.CREATE_NO_WINDOW,
@@ -177,6 +219,7 @@ class WranglerLogin:
         self.lock = Lock()
         self.stop = Event()
         self.thread = None
+        self.prepare_thread = None
         self.phase = "idle"
         self.message = ""
         self.url = ""
@@ -189,6 +232,54 @@ class WranglerLogin:
             return {"phase": self.phase, "message": self.message, "url": self.url,
                     "choices": list(self.choices), "revision": self.revision}
 
+    def prepare(self):
+        if read_wrangler_profile().get("oauth_token"):
+            return
+        with self.lock:
+            if self.prepare_thread is not None or self.thread is not None or self.stop.is_set():
+                return
+            npx = shutil.which("npx.cmd")
+            if not npx:
+                return
+            self.prepare_thread = Thread(target=self.prepare_cache, args=(npx,), name="wrangler-cache", daemon=True)
+            self.prepare_thread.start()
+
+    def prepare_cache(self, npx):
+        try:
+            environment = wrangler_environment()
+            if self.run_preparation(wrangler_command(npx, "--version", offline=True), TEMP_DIR, environment, 8):
+                return
+            npm = shutil.which("npm.cmd")
+            if not npm or self.stop.is_set():
+                return
+            WRANGLER_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            ready = WRANGLER_RUNTIME_DIR / ".ready"
+            ready.unlink(missing_ok=True)
+            for filename in ("package.json", "package-lock.json"):
+                shutil.copyfile(WRANGLER_SPEC_DIR / filename, WRANGLER_RUNTIME_DIR / filename)
+            if self.run_preparation(
+                [npm, "ci", "--prefer-offline", "--no-audit", "--no-fund"],
+                WRANGLER_RUNTIME_DIR, environment, WRANGLER_PREPARE_TIMEOUT,
+            ):
+                ready.write_text(WRANGLER_VERSION, encoding="utf-8")
+        except OSError:
+            pass
+
+    def run_preparation(self, command, cwd, environment, timeout):
+        process = None
+        try:
+            process = subprocess.Popen(
+                command, cwd=cwd, env=environment,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            deadline = time.monotonic() + timeout
+            while process.poll() is None and time.monotonic() < deadline and not self.stop.wait(0.2):
+                pass
+            return process.poll() == 0
+        finally:
+            stop_wrangler(process)
+
     def start(self):
         with self.lock:
             if self.thread is not None and self.thread.is_alive():
@@ -198,7 +289,7 @@ class WranglerLogin:
                 raise CloudflareError("未找到 Node.js，请先安装 Node.js 后再登录。")
             self.stop.clear()
             self.phase = "starting"
-            self.message = "正在准备 Cloudflare 登录页面。"
+            self.message = "正在准备 Wrangler，首次使用需要下载登录工具。"
             self.url = ""
             self.choices = []
             self.thread = Thread(target=self.run, args=(npx,), name="wrangler-login", daemon=True)
@@ -237,14 +328,25 @@ class WranglerLogin:
         self.stop.set()
         with self.lock:
             thread = self.thread
+            preparation = self.prepare_thread
         if thread is not None:
             thread.join(timeout=10)
+        if preparation is not None:
+            preparation.join(timeout=10)
 
     def run(self, npx):
         process = None
         output = Queue()
         error_message = "登录未完成，请检查网络后重试。"
+        link_ready = False
+        deadline = time.monotonic() + WRANGLER_LINK_TIMEOUT
         try:
+            with self.lock:
+                preparation = self.prepare_thread
+            while preparation is not None and preparation.is_alive() and not self.stop.wait(0.2):
+                pass
+            if self.stop.is_set():
+                return
             environment = wrangler_environment()
             for key in ("CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY", "CLOUDFLARE_EMAIL"):
                 environment.pop(key, None)
@@ -254,8 +356,7 @@ class WranglerLogin:
                     and re.fullmatch(r"[a-z0-9_-]+:[a-z0-9_-]+", scope) and scope not in scopes):
                     scopes.append(scope)
             process = subprocess.Popen(
-                [npx, "--yes", f"wrangler@{WRANGLER_VERSION}", "login",
-                 "--browser=false", "--scopes", *scopes],
+                wrangler_command(npx, "login", "--browser=false", "--scopes", *scopes),
                 cwd=TEMP_DIR, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                 bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW,
@@ -269,7 +370,6 @@ class WranglerLogin:
                     output.put(None)
 
             Thread(target=read_output, daemon=True).start()
-            deadline = time.monotonic() + 300
             while not self.stop.is_set() and time.monotonic() < deadline:
                 try:
                     line = output.get(timeout=1)
@@ -288,11 +388,15 @@ class WranglerLogin:
                     error_message = "本机授权端口 8976 正在使用，请关闭其他登录窗口后重试。"
                 elif "access_denied" in line or "consent denied" in line.lower():
                     error_message = "未完成 Cloudflare 授权，请重新登录并允许授权。"
+                elif not link_ready and re.search(r"\b(?:ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|ENETUNREACH)\b", line):
+                    error_message = "Wrangler 下载失败，请检查 npm 仓库连接后重试。"
                 match = re.search(r"https://dash\.cloudflare\.com/oauth2/auth\?[^\s\x1b]+", line)
-                if match and not self.url:
+                if match and not link_ready:
                     url = match.group(0)
                     parsed = urlsplit(url)
                     if parsed.scheme == "https" and parsed.netloc == "dash.cloudflare.com":
+                        link_ready = True
+                        deadline = time.monotonic() + WRANGLER_AUTH_TIMEOUT
                         with self.lock:
                             self.phase = "waiting"
                             self.message = "请在打开的 Cloudflare 页面登录并点击 Allow，然后返回这里。"
@@ -304,29 +408,12 @@ class WranglerLogin:
             if self.stop.is_set():
                 error_message = "登录已停止，请重新登录。"
             elif time.monotonic() >= deadline:
-                error_message = "等待授权超时，请重新登录。"
+                error_message = ("等待授权超时，请重新登录。" if link_ready
+                                 else "Wrangler 启动超时，请检查 npm 仓库连接后重试。")
         except (OSError, subprocess.SubprocessError):
             error_message = "无法启动 Cloudflare 登录，请检查 Node.js 和网络后重试。"
         finally:
-            if process is not None and process.poll() is None:
-                try:
-                    result = subprocess.run(
-                        ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        timeout=5, creationflags=subprocess.CREATE_NO_WINDOW,
-                    )
-                    if result.returncode and process.poll() is None:
-                        process.terminate()
-                except (OSError, subprocess.SubprocessError):
-                    if process.poll() is None:
-                        try:
-                            process.terminate()
-                        except OSError:
-                            pass
-                try:
-                    process.wait(timeout=5)
-                except (OSError, subprocess.SubprocessError):
-                    pass
+            stop_wrangler(process)
         with self.lock:
             self.phase = "error"
             self.message = error_message

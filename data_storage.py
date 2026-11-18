@@ -18,6 +18,7 @@ PAGES_CONFIG_FILE = DATA_DIR / "wrangler.jsonc"
 WRANGLER_CONFIG_DIR = DATA_DIR / "wrangler"
 WRANGLER_PROFILE_FILE = WRANGLER_CONFIG_DIR / ".wrangler" / "config" / "default.toml"
 WRANGLER_CACHE_DIR = DATA_DIR / "cache"
+WRANGLER_RUNTIME_DIR = DATA_DIR / "wrangler-cli"
 TEMP_DIR = DATA_DIR / "tmp"
 
 

@@ -676,6 +676,8 @@ def create_app(manager):
     @app.post("/platform/<action>")
     def change_platform(action):
         profile_id = request.form.get("profile_id", "")
+        auth_action = action in ("login", "discover", "choose")
+        wants_auth_json = auth_action and request.accept_mimetypes.best == "application/json"
         if action == "save":
             values = {key: request.form.get(key, "").strip()
                       for key in ("name", "account_id", "database_id", "database_name", "auth_source")}
@@ -711,11 +713,17 @@ def create_app(manager):
                 else:
                     abort(404)
             except (ValueError, CloudflareError) as error:
+                if wants_auth_json:
+                    return jsonify(message=str(error)), 422
                 flash(str(error), "error")
             except OSError:
+                if wants_auth_json:
+                    return jsonify(message="无法读取或保存本机平台配置。"), 500
                 flash("无法读取或保存本机平台配置。", "error")
+        if wants_auth_json:
+            return jsonify(login=manager.wrangler_login.snapshot(), wrangler=wrangler_login_status()), 202
         return redirect(url_for("platform_settings", profile=profile_id or None,
-                                _anchor="wrangler-heading" if action in ("login", "discover", "choose") else None), code=303)
+                                _anchor="wrangler-heading" if auth_action else None), code=303)
 
     @app.post("/project/create")
     def create_project():
@@ -816,6 +824,7 @@ def main():
     server = make_server("127.0.0.1", ADMIN_PORT, create_app(manager), threaded=True)
     print(f"NATMap 管理页 {ADMIN_URL}  按 Ctrl+C 关闭。", flush=True)
     try:
+        manager.wrangler_login.prepare()
         manager.start_saved_projects()
         webbrowser.open(ADMIN_URL)
         server.serve_forever()

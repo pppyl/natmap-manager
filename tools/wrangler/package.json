@@ -1,0 +1,7 @@
+{
+  "name": "natmap-wrangler",
+  "private": true,
+  "dependencies": {
+    "wrangler": "4.162.0"
+  }
+}
