@@ -584,7 +584,7 @@ async function updateCreateForm(projects) {
     createForm.elements.namedItem("scheme").value = "auto";
     syncCreateProtocol();
     const host = createForm.elements.namedItem("target_host");
-    if (host) host.selectedIndex = 0;
+    if (host) host.value = "127.0.0.1";
     createForm.querySelector(".advanced-settings").open = false;
     setCreatePending(false);
     if (createDialog.open) {
@@ -614,7 +614,11 @@ async function updateStatus() {
       row.querySelector("[data-stop]").hidden = !["运行中", "正在重启"].includes(project.phase);
       panel.querySelector("[data-delete]").disabled = project.busy;
       const targetPort = row.querySelector("[data-target-port]");
-      if (targetPort) targetPort.textContent = project.display_target_endpoint ?? project.display_target_port ?? project.target_port;
+      if (targetPort) {
+        const endpoint = project.display_target_endpoint ?? project.display_target_port ?? project.target_port;
+        targetPort.textContent = endpoint;
+        targetPort.title = endpoint;
+      }
       row.querySelector("[data-local-port]").textContent = project.local_port ?? "自动分配";
       const scheme = row.querySelector("[data-scheme]");
       if (scheme) scheme.title = scheme.textContent = project.scheme_label ?? project.scheme.toUpperCase();

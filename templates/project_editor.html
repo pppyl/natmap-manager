@@ -31,7 +31,7 @@
           <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="slug" value="{{ project.slug }}">
           <div class="edit-grid">
             <label>项目名称<input name="name" value="{{ fields.name }}" maxlength="60" required></label>
-            <label>服务监听地址<select name="target_host">{{ target_host_options(fields.target_host or project.target_host) }}</select></label>
+            <label>服务监听地址{{ target_host_input(fields.target_host if fields.target_host is not none else project.target_host) }}</label>
             <label>服务端口<input type="number" name="target_port" min="1" max="65535" value="{{ fields.target_port }}" required></label>
             <label>NATMap 本地端口（选填）<input type="number" name="bind_port" min="1" max="65535" value="{{ fields.bind_port if fields.bind_port is not none else '' }}" placeholder="留空自动分配"></label>
             <label>本地协议<select name="scheme">{{ scheme_options(fields.scheme, allow_web=project.entry) }}</select></label>

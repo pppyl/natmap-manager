@@ -85,7 +85,8 @@
                 </div>
               </td>
               <td class="project-ports">
-                <div><span>服务</span><strong data-target-port>{{ project.display_target_endpoint | default(project.display_target_port) }}</strong></div>
+                {% set endpoint = project.display_target_endpoint | default(project.display_target_port) %}
+                <div><span>服务</span><strong data-target-port title="{{ endpoint }}">{{ endpoint }}</strong></div>
                 <div><span>NATMap</span><strong data-local-port>{{ project.local_port if project.local_port is not none else '自动分配' }}</strong></div>
               </td>
               <td class="project-protocol" data-scheme title="{{ project.scheme_label }}">{{ project.scheme_label }}</td>

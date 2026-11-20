@@ -4,6 +4,7 @@ from argparse import ArgumentTypeError, Namespace
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 import hmac
+from ipaddress import ip_address
 import json
 from pathlib import Path
 from secrets import token_hex, token_urlsafe
@@ -17,7 +18,7 @@ from flask import Flask, abort, flash, jsonify, redirect, render_template, reque
 from werkzeug.serving import make_server
 
 from data_storage import PROJECTS_FILE, ensure_data
-from duckdns_natmap import DEFAULT_NATMAP, DEFAULT_TARGET_HOST, MAPPING_SCHEMES, RDP_PORT, SETTINGS_FILE, TARGET_HOSTS, port, run_locked_mapping, save_access_address, target_endpoint
+from duckdns_natmap import DEFAULT_NATMAP, DEFAULT_TARGET_HOST, MAPPING_SCHEMES, RDP_PORT, SETTINGS_FILE, normalize_target_host, port, run_locked_mapping, save_access_address, target_endpoint
 from pages_projects import CloudflareError, LOGIN_COMMAND, PAGES_HOST, PROJECT_NAME, PagesNameUnavailable, PagesProjects, WranglerLogin, cloudflare_request, discover_cloudflare_connections, project_token
 from platform_settings import AUTH_LABELS, PlatformProfile, PlatformSettings, pages_config, wrangler_login_status, write_json
 
@@ -69,23 +70,29 @@ class Project:
             raise ProjectInputError("slug", "子域名长度为 1 到 40，使用小写英文字母、数字或连字符，首尾不能为连字符。")
         if not self.name.strip() or len(self.name) > 60:
             raise ProjectInputError("name", "请填写项目名称，最多 60 个字。")
-        if self.target_host not in TARGET_HOSTS:
-            raise ProjectInputError("target_host", "请选择 IPv4 或 IPv6 回环地址。")
+        try:
+            object.__setattr__(self, "target_host", normalize_target_host(self.target_host))
+        except ValueError as error:
+            raise ProjectInputError("target_host", str(error)) from error
         project_port(self.target_port, "target_port")
         if self.bind_port is not None:
             project_port(self.bind_port, "bind_port")
-        if self.target_port == ADMIN_PORT:
+        if self.target_is_loopback and self.target_port == ADMIN_PORT:
             raise ProjectInputError("target_port", f"端口 {ADMIN_PORT} 正由本机管理页使用。")
         if self.bind_port == ADMIN_PORT:
             raise ProjectInputError("bind_port", f"端口 {ADMIN_PORT} 正由本机管理页使用。")
-        if self.target_port == self.bind_port:
-            raise ProjectInputError("bind_port", "NATMap 本地端口必须与服务端口不同。")
+        if self.target_is_loopback and self.target_port == self.bind_port:
+            raise ProjectInputError("bind_port", "NATMap 本地端口必须与本机服务端口不同。")
         if self.scheme not in MAPPING_SCHEMES:
             raise ProjectInputError("scheme", "请选择自动检测、HTTP、HTTPS 或 TCP。")
         if self.entry:
             host = urlsplit(self.entry).netloc
             if not PAGES_HOST.fullmatch(host) or self.entry != f"https://{host}":
                 raise ValueError("项目入口必须是有效的 HTTPS Pages 网址。")
+
+    @property
+    def target_is_loopback(self):
+        return ip_address(self.target_host).is_loopback
 
     @property
     def ready(self):
@@ -373,15 +380,19 @@ class Manager:
     def check_mapping_ports(self, project):
         used = {ADMIN_PORT}
         for other_slug, other in self.projects.items():
-            used.update((other.bind_port, other.target_port))
+            used.add(other.bind_port)
+            if other.target_is_loopback:
+                used.add(other.target_port)
             if other_slug == project.slug or not self.active(other_slug):
                 continue
             task = self.tasks[other_slug]
             if task.bind_port is None:
                 continue
-            active_ports = (task.bind_port, task.project.target_port)
+            active_ports = {task.bind_port}
+            if task.project.target_is_loopback:
+                active_ports.add(task.project.target_port)
             used.update(active_ports)
-            if project.bind_port in active_ports or project.target_port == task.bind_port:
+            if project.bind_port in active_ports or (project.target_is_loopback and project.target_port == task.bind_port):
                 raise ValueError(f"端口与运行中的「{other.name}」冲突。")
         return used
 

@@ -24,11 +24,11 @@
           <input type="number" name="target_port" min="1" max="65535" placeholder="{{ '3389' if values.scheme == 'tcp' else '5000' }}" value="{{ values.target_port | default('') }}" {{ issue_attributes('target_port') }} required>
           {{ create_issue('target_port') }}
         </label>
-        <details class="advanced-settings"{% if values.target_host == '::1' or values.bind_port or values.scheme in ('http', 'https', 'tcp') or (issue and issue.field in ('target_host', 'bind_port', 'scheme')) %} open{% endif %}>
+        <details class="advanced-settings"{% if (values.target_host and values.target_host != '127.0.0.1') or values.bind_port or values.scheme in ('http', 'https', 'tcp') or (issue and issue.field in ('target_host', 'bind_port', 'scheme')) %} open{% endif %}>
           <summary>高级设置</summary>
           <div class="advanced-fields">
             <label>服务监听地址
-              <select name="target_host" {{ issue_attributes('target_host') }}>{{ target_host_options(values.target_host) }}</select>
+              {{ target_host_input(values.target_host | default('127.0.0.1'), issue_attributes('target_host')) }}
               {{ create_issue('target_host') }}
             </label>
             <label>本地协议

@@ -3,7 +3,7 @@
 import argparse
 from contextlib import ExitStack, closing
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
-from ipaddress import IPv4Address
+from ipaddress import IPv4Address, ip_address
 from itertools import cycle
 import json
 import msvcrt
@@ -26,7 +26,6 @@ from pages_projects import CloudflareError, PROJECT_NAME, project_token
 
 DEFAULT_NATMAP = Path(__file__).with_name("natmap-win-x64.exe")
 DEFAULT_TARGET_HOST = "127.0.0.1"
-TARGET_HOSTS = (DEFAULT_TARGET_HOST, "::1")
 MAPPING_SCHEMES = ("auto", "http", "https", "tcp")
 RDP_PORT = 3389
 # X.224 Connection Request with an RDP Negotiation Request for TLS and CredSSP.
@@ -52,6 +51,22 @@ def port(value):
 
 def target_endpoint(host, port_number):
     return f"[{host}]:{port_number}" if ":" in host else f"{host}:{port_number}"
+
+
+def normalize_target_host(value):
+    host = value.strip() if isinstance(value, str) else ""
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        address = ip_address(host)
+    except ValueError as error:
+        raise ValueError("请输入服务的 IPv4 或 IPv6 地址，端口请单独填写。") from error
+    address = getattr(address, "ipv4_mapped", None) or address
+    if address.version == 6 and (address.is_link_local or address.scope_id):
+        raise ValueError("请输入可直接访问的 IPv4 或 IPv6 地址，链路本地 IPv6 需要网卡作用域。")
+    if address.is_unspecified or address.is_multicast or str(address) == "255.255.255.255":
+        raise ValueError("请输入运行服务的设备 IP 地址。")
+    return str(address)
 
 
 def available_bind_port(target_port):
@@ -423,8 +438,8 @@ def main():
     parser = argparse.ArgumentParser(description="建立 NATMap TCP IPv4 映射并更新固定入口")
     parser.add_argument("--natmap", default=str(DEFAULT_NATMAP), help="NATMap 可执行文件路径")
     parser.add_argument("--project", help="使用管理页面中已保存项目的子域名")
-    parser.add_argument("--target-host", choices=TARGET_HOSTS, help="本机网页监听地址，默认读取项目设置")
-    parser.add_argument("--target-port", type=port, help="本机网页端口，默认读取项目设置")
+    parser.add_argument("--target-host", help="目标服务的 IPv4 或 IPv6 地址，默认读取项目设置")
+    parser.add_argument("--target-port", type=port, help="目标服务端口，默认读取项目设置")
     parser.add_argument("--bind-port", type=port, help="NATMap 本地监听端口，默认读取项目设置")
     parser.add_argument("--settings", type=Path, help=f"端口和固定入口配置，默认 {SETTINGS_FILE}")
     mode = parser.add_mutually_exclusive_group()
@@ -458,9 +473,6 @@ def main():
         target_port = project.get("target_port") if project else settings.get("target_port", 21580)
         args.target_port = args.target_port or port(str(target_port))
         origin_settings = project if project else settings
-        args.target_host = args.target_host or origin_settings.get("target_host", DEFAULT_TARGET_HOST)
-        if args.target_host not in TARGET_HOSTS:
-            parser.error("本机网页监听地址须为 127.0.0.1 或 ::1。")
         bind_port = project.get("bind_port") if project else settings.get("bind_port", 21581)
         args.bind_port = args.bind_port or (port(str(bind_port)) if bind_port else available_bind_port(args.target_port))
         if project:
@@ -471,6 +483,12 @@ def main():
                 args.scheme = "https"
     except (OSError, ValueError, argparse.ArgumentTypeError):
         parser.error("无法读取设置，请检查 JSON 格式和端口范围。")
+
+    host = args.target_host if args.target_host is not None else origin_settings.get("target_host", DEFAULT_TARGET_HOST)
+    try:
+        args.target_host = normalize_target_host(host)
+    except ValueError as error:
+        parser.error(str(error))
 
     redirect = None
     if args.publish and getattr(args, "scheme", None) != "tcp":
@@ -496,8 +514,8 @@ def main():
         except (KeyError, TypeError, AttributeError, ValueError):
             parser.error("发布模式需要有效的固定入口和更新令牌。请用 --project 指定已保存的项目。")
 
-    if args.bind_port == args.target_port:
-        parser.error("NATMap 监听端口必须与网页端口不同")
+    if ip_address(args.target_host).is_loopback and args.bind_port == args.target_port:
+        parser.error("NATMap 监听端口必须与本机服务端口不同")
     executable = shutil.which(args.natmap)
     if executable is None:
         parser.error("找不到 NATMap，请通过 --natmap 指定 Windows 可执行文件")

@@ -6,9 +6,9 @@
     {% endif %}
   {% endfor %}
 {%- endmacro %}
-{%- macro target_host_options(selected) -%}
-  <option value="127.0.0.1"{% if selected != '::1' %} selected{% endif %}>IPv4（127.0.0.1）</option>
-  <option value="::1"{% if selected == '::1' %} selected{% endif %}>IPv6（::1）</option>
+{%- macro target_host_input(value, attributes='') -%}
+  <input name="target_host" value="{{ value }}" list="target-host-presets" spellcheck="false" autocomplete="off"
+         placeholder="如 192.168.1.20" {{ attributes }} required>
 {%- endmacro %}
 <html lang="zh-CN">
 <head>
@@ -19,6 +19,10 @@
   <script src="{{ url_for('static', filename='natmap.js') }}" defer></script>
 </head>
 <body>
+  <datalist id="target-host-presets">
+    <option value="127.0.0.1" label="本机 IPv4"></option>
+    <option value="::1" label="本机 IPv6"></option>
+  </datalist>
   <header class="masthead">
     <div class="shell masthead-row project-shell">
       <div><h1>NATMap 管理</h1><p>管理本机项目的公网入口</p></div>
