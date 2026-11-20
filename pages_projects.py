@@ -15,6 +15,7 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
+from uuid import UUID
 import webbrowser
 
 from data_storage import TEMP_DIR, WRANGLER_CACHE_DIR, WRANGLER_CONFIG_DIR, WRANGLER_RUNTIME_DIR
@@ -28,6 +29,7 @@ WRANGLER_AUTH_TIMEOUT = 300
 WRANGLER_SPEC_DIR = Path(__file__).parent / "tools" / "wrangler"
 PROJECT_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?\Z")
 PAGES_HOST = re.compile(r"[a-z0-9-]+\.pages\.dev\Z")
+MAPPING_LEASE_SECONDS = 180  # Keep this aligned with LEASE_MS in the Pages function.
 
 
 def powershell_path(path):
@@ -472,6 +474,31 @@ class PagesProjects:
         self.api(token, "?per_page=1")
         database = self.account_api(token, f"/d1/database/{self.platform.database_id}")
         return database["name"]
+
+    def publish_mapping(self, name, entry, owner_id, location):
+        if not owner_id or not PROJECT_NAME.fullmatch(name):
+            raise CloudflareError("无法确认固定入口的项目归属。")
+        token = self.token()
+        project = self.api(token, f"/{name}", missing_ok=True)
+        if (not project or project.get("name") != name
+            or f'https://{project.get("subdomain")}' != entry or not has_project_owner(project, owner_id)):
+            raise CloudflareError("无法在当前 Cloudflare 连接中确认这个 Pages 项目，请切换到创建它的账号。")
+        production = project["deployment_configs"]["production"]
+        variables = production.get("env_vars") or {}
+        if (variables.get("NATMAP_PROJECT") or {}).get("value") != name:
+            raise CloudflareError("Pages 项目的映射记录名称不匹配，请检查生产部署。")
+        binding = (production.get("d1_databases") or {}).get("REDIRECT_DB") or {}
+        try:
+            database_id = str(UUID(binding.get("id") or binding.get("database_id")))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise CloudflareError("Pages 项目缺少有效的 REDIRECT_DB 数据库绑定。") from error
+        result = self.account_api(token, f"/d1/database/{database_id}/query", method="POST", payload={
+            "sql": "INSERT INTO natmap_projects (project, location, expires_at) VALUES (?, ?, (unixepoch('now') + ?) * 1000) "
+                   "ON CONFLICT(project) DO UPDATE SET location = excluded.location, expires_at = excluded.expires_at",
+            "params": [name, location, str(MAPPING_LEASE_SECONDS)],
+        })
+        if not isinstance(result, list) or not result or not isinstance(result[0], dict) or not result[0].get("success"):
+            raise CloudflareError("D1 未确认写入映射地址。")
 
     def prepare_database(self, token):
         if self.platform.database_id == self.legacy_database:

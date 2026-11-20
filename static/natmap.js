@@ -91,6 +91,7 @@ function renderConnection(row, panel, text) {
   const label = phase.dataset.state === "运行中" ? mappingStatus(text) : phase.dataset.state;
   if (phase.textContent !== label) phase.textContent = label;
   phase.toggleAttribute("data-waiting", label !== phase.dataset.state);
+  phase.title = label === "入口待重试" ? text.split("\n", 1)[0] : "";
 
   const detail = panel.querySelector("[data-detail]") || row.querySelector("[data-detail]");
   const rdp = row.hasAttribute("data-rdp");

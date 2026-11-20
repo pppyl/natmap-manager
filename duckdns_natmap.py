@@ -16,11 +16,12 @@ import subprocess
 from tempfile import gettempdir
 from threading import Event, Thread
 import time
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import ProxyHandler, Request, build_opener, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from data_storage import ACCESS_ADDRESS_FILE, PROJECTS_FILE, SETTINGS_FILE, ensure_data
-from pages_projects import PROJECT_NAME, project_token
+from pages_projects import CloudflareError, PROJECT_NAME, project_token
 
 
 DEFAULT_NATMAP = Path(__file__).with_name("natmap-win-x64.exe")
@@ -79,6 +80,17 @@ def parse_mapping(line):
     return None
 
 
+class RedirectUpdateError(RuntimeError):
+    def __init__(self, message, *, allow_fallback=False):
+        super().__init__(message)
+        self.allow_fallback = allow_fallback
+
+
+class NoUpdateRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def update_redirect(url, token, scheme, address, public_port, *, system_proxy=False):
     request = Request(
         f"{url}/_natmap",
@@ -86,16 +98,58 @@ def update_redirect(url, token, scheme, address, public_port, *, system_proxy=Fa
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "User-Agent": "wxcloud-natmap/1.0",
+            "User-Agent": "NATMap-Manager/1.0 (+https://github.com/pppyl/natmap-manager)",
         },
         method="PUT",
     )
-    open_request = urlopen if system_proxy else build_opener(ProxyHandler({})).open
+    proxy = ProxyHandler() if system_proxy else ProxyHandler({})
     try:
-        with open_request(request, timeout=10) as response:
-            return response.status == 204
-    except (OSError, HTTPException):
-        return False
+        with build_opener(proxy, NoUpdateRedirect()).open(request, timeout=10) as response:
+            if response.status != 204:
+                raise RedirectUpdateError(f"固定入口返回 HTTP {response.status}，更新需要 HTTP 204。")
+    except HTTPError as error:
+        status = error.code
+        error.close()
+        hints = {
+            400: "Cloudflare 拒绝了映射地址或协议。",
+            401: "固定入口的更新令牌未通过验证。",
+            403: "Cloudflare 拒绝了固定入口更新请求。",
+            404: "找不到固定入口的更新接口，请检查 Pages 部署。",
+            405: "固定入口未启用更新接口，请检查 Pages 部署。",
+            429: "Cloudflare 暂时限制了更新频率。",
+        }
+        hint = hints.get(status, "请检查固定入口的 Pages 函数。")
+        raise RedirectUpdateError(
+            f"HTTP {status}，{hint}", allow_fallback=status in (401, 403) or 500 <= status <= 599,
+        ) from error
+    except (OSError, HTTPException) as error:
+        cause = error.reason if isinstance(error, URLError) else error
+        if isinstance(cause, socket.gaierror):
+            message = "固定入口域名解析失败。"
+        elif isinstance(cause, TimeoutError):
+            message = "连接固定入口超时。"
+        elif isinstance(cause, ssl.SSLError):
+            message = "固定入口的 HTTPS 握手或证书验证失败。"
+        else:
+            message = "固定入口连接中断，请检查网络。"
+        raise RedirectUpdateError(message, allow_fallback=True) from error
+
+
+def publish_mapping(redirect, scheme, address, public_port, direct_url, *, system_proxy, publish_via_d1):
+    try:
+        update_redirect(*redirect, scheme, address, public_port, system_proxy=system_proxy)
+    except RedirectUpdateError as error:
+        if publish_via_d1 is None or not error.allow_fallback:
+            raise
+        location = f"tcp://{direct_url}" if scheme == "tcp" else direct_url + "/"
+        try:
+            publish_via_d1(location)
+        except (CloudflareError, ValueError) as fallback_error:
+            raise RedirectUpdateError(f"{error} D1 同步失败。{fallback_error}") from fallback_error
+        except (OSError, KeyError, TypeError) as fallback_error:
+            raise RedirectUpdateError(f"{error} D1 同步失败，请检查本机平台配置。") from fallback_error
+        return f"固定入口已通过 Cloudflare D1 同步。Pages 上报结果为 {error}"
+    return ""
 
 
 def save_access_address(text):
@@ -185,7 +239,8 @@ def read_natmap_output(stream, messages):
 
 
 def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None,
-                     report=log_line, save_address=save_access_address, rdp_lookup_enabled=None):
+                     report=log_line, save_address=save_access_address, rdp_lookup_enabled=None,
+                     publish_via_d1=None):
     """Run one NATMap attempt and report whether the local address could not be reused."""
     messages = Queue()
     stop = stop if stop is not None else Event()
@@ -193,6 +248,7 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
         return False
     mapping = None
     redirected_mapping = None
+    last_publish_note = ""
     direct_url = None
     refresh_redirect_at = 0
     default_port = 443 if scheme == "https" else 80
@@ -244,20 +300,25 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
                     continue
                 if scheme == "tcp" and (rdp_lookup_enabled is None or not rdp_lookup_enabled()):
                     continue
-                entry, redirect_token = redirect
                 address, public_port = mapping
-                if update_redirect(entry, redirect_token, scheme, address, public_port, system_proxy=system_proxy):
-                    refresh_redirect_at = time.monotonic() + REDIRECT_REFRESH_SECONDS
-                    if mapping != redirected_mapping:
-                        redirected_mapping = mapping
-                        message = "外网远程命令已同步。" if scheme == "tcp" else f"固定入口 {entry}/"
-                        save_address(f"{message}\n直连地址 {direct_url}")
-                        report(message)
-                else:
+                try:
+                    note = publish_mapping(redirect, scheme, address, public_port, direct_url,
+                                           system_proxy=system_proxy, publish_via_d1=publish_via_d1)
+                except RedirectUpdateError as error:
                     refresh_redirect_at = time.monotonic() + REDIRECT_RETRY_SECONDS
                     redirected_mapping = None
-                    save_address(f"固定入口更新暂未确认。\n直连地址 {direct_url}")
-                    report(f"固定入口更新暂未确认，{REDIRECT_RETRY_SECONDS} 秒后重试。")
+                    save_address(f"固定入口更新暂未确认。{error}\n直连地址 {direct_url}")
+                    report(f"固定入口更新暂未确认。{error} {REDIRECT_RETRY_SECONDS} 秒后重试。")
+                else:
+                    refresh_redirect_at = time.monotonic() + REDIRECT_REFRESH_SECONDS
+                    if mapping != redirected_mapping or note != last_publish_note:
+                        redirected_mapping = mapping
+                        last_publish_note = note
+                        message = "外网远程命令已同步。" if scheme == "tcp" else f"固定入口 {redirect[0]}/"
+                        save_address(f"{message}\n直连地址 {direct_url}")
+                        if note:
+                            report(note)
+                        report(message)
         finally:
             if process.poll() is None:
                 try:
@@ -270,7 +331,8 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
 
 
 def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
-               save_address=save_access_address, on_scheme=None, rdp_lookup_enabled=None):
+               save_address=save_access_address, on_scheme=None, rdp_lookup_enabled=None,
+               publish_via_d1=None):
     stop = stop if stop is not None else Event()
     # Also detect a listener from an older launch that predates the lock.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -317,7 +379,7 @@ def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
             report(f"TCP 保活目标 {keepalive_host}:80，STUN 目标 {stun_server}。")
             address_error = maintain_mapping(command, scheme, mapping_redirect, system_proxy=args.system_proxy,
                                              stop=stop, report=report, save_address=save_address,
-                                             rdp_lookup_enabled=rdp_lookup_enabled)
+                                             rdp_lookup_enabled=rdp_lookup_enabled, publish_via_d1=publish_via_d1)
             if stop.is_set():
                 break
             if track_address:

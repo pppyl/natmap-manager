@@ -495,11 +495,16 @@ class Manager:
                                  bind_port=task.bind_port, scheme=project.scheme, system_proxy=False)
                 redirect = (project.entry, self.publish_token(project)) if project.entry else None
 
+                def publish_via_d1(location):
+                    pages = PagesProjects(self.platforms.selected())
+                    pages.publish_mapping(project.slug, project.entry, project.owner, location)
+
                 result = run_locked_mapping(
                     args, str(DEFAULT_NATMAP), redirect,
                     project="" if project.slug == self.default_slug else project.slug,
                     stop=task.stop, report=report, save_address=save_address, on_scheme=save_scheme,
                     rdp_lookup_enabled=(lambda: self.prepare_remote_lookup(project)) if project.supports_remote_lookup else None,
+                    publish_via_d1=publish_via_d1 if project.entry and project.owner else None,
                 )
             with self.lock:
                 if task.phase != "正在重启" or self.closing.is_set():
