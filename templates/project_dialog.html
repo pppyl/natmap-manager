@@ -24,8 +24,8 @@
           </select>
           {{ create_issue('target_kind') }}
         </label>
-        <label data-create-entry{% if values.scheme == 'tcp' and not manager_target %} hidden{% endif %}>独立子域名
-          <span class="suffix"><input name="slug" pattern="[a-z0-9]([a-z0-9\x2D]{0,38}[a-z0-9])?" maxlength="40" placeholder="workbench" value="{{ values.slug | default('') }}" {{ issue_attributes('slug') }}{% if values.scheme == 'tcp' and not manager_target %} disabled{% else %} required{% endif %}><span>.pages.dev</span></span>
+        <label>独立子域名<span data-tcp-entry-optional{% if values.scheme != 'tcp' or manager_target %} hidden{% endif %}>（选填）</span>
+          <span class="suffix"><input name="slug" pattern="[a-z0-9]([a-z0-9\x2D]{0,38}[a-z0-9])?" maxlength="40" placeholder="workbench" value="{{ values.slug | default('') }}" {{ issue_attributes('slug') }}{% if values.scheme != 'tcp' or manager_target %} required{% endif %}><span>.pages.dev</span></span>
           {{ create_issue('slug') }}
         </label>
         <label data-create-target-port{% if manager_target %} hidden{% endif %}>服务端口

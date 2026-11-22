@@ -1,12 +1,15 @@
 const UPDATE_PATH = "/_natmap";
 const COMMAND_PATH = "/_natmap/remote";
+const RDP_PAGE = "/remote/";
+const TCP_PAGE = "/tcp/";
+const LOOKUP_ASSETS = new Set(["/remote/connection.js", "/remote/connection.css"]);
 const LEASE_MS = 180_000;
 const NO_CACHE = { "Cache-Control": "no-store" };
 const REMOTE_HEADERS = {
   ...NO_CACHE,
   "Referrer-Policy": "no-referrer",
   "X-Robots-Tag": "noindex, nofollow",
-  "X-NATMap-Remote-Version": "10",
+  "X-NATMap-Remote-Version": "11",
 };
 const encoder = new TextEncoder();
 const WEB_PROXY_HEADERS = { "X-NATMap-Entry-Mode": "proxy" };
@@ -48,7 +51,7 @@ async function serveRemoteAsset(request, env, pathname) {
   const asset = await env.ASSETS.fetch(assetRequest);
   const headers = new Headers(asset.headers);
   for (const [name, value] of Object.entries(REMOTE_HEADERS)) headers.set(name, value);
-  headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'");
+  headers.set("Content-Security-Policy", "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'");
   return new Response(asset.body, { status: asset.status, headers });
 }
 
@@ -185,7 +188,7 @@ export default {
       }
       const { ip, port, scheme } = payload ?? {};
       if (!isPublicIPv4(ip) || !Number.isInteger(port) || port < 1 || port > 65535 ||
-          !["http", "https", "tcp"].includes(scheme) || (httpsOnly && scheme !== "https")) {
+          !["http", "https", "tcp", "tcp-address"].includes(scheme) || (httpsOnly && scheme !== "https")) {
         return new Response("Invalid public IPv4, port or scheme", { status: 400, headers: NO_CACHE });
       }
       const target = new URL(`${scheme}://${ip}:${port}`);
@@ -199,14 +202,17 @@ export default {
     const proxy = env.NATMAP_WEB_MODE === "proxy";
     const reading = request.method === "GET" || request.method === "HEAD";
     const remote = pathname === COMMAND_PATH;
-    const remoteAsset = pathname === "/remote/" || pathname === "/remote/connection.js";
+    const lookupAsset = LOOKUP_ASSETS.has(pathname);
+    const lookupPage = pathname === RDP_PAGE || pathname === TCP_PAGE;
     if (pathname === UPDATE_PATH || (!reading && (remote || !proxy))) {
       return new Response(null, { status: 404, headers: NO_CACHE });
     }
-    if (!proxy && !httpsOnly && remoteAsset) {
+    if (!proxy && !httpsOnly && lookupAsset) {
       return serveRemoteAsset(request, env, pathname);
     }
-    if (!proxy && !httpsOnly && !remote && pathname !== "/") return new Response(null, { status: 404, headers: NO_CACHE });
+    if (!proxy && !httpsOnly && !remote && !lookupPage && pathname !== "/") {
+      return new Response(null, { status: 404, headers: NO_CACHE });
+    }
     const mapping = await env.REDIRECT_DB.prepare(`
       SELECT location, expires_at FROM natmap_projects WHERE project = ?
     `).bind(project).first();
@@ -215,7 +221,7 @@ export default {
       return proxyError("管理页入口需要 HTTPS 回源。");
     }
     if (remote) {
-      const address = location?.match(/^tcp:\/\/((\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5}))$/);
+      const address = location?.match(/^(?:tcp|tcp-address):\/\/((\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5}))$/);
       if (!address || !isPublicIPv4(address[2]) || Number(address[3]) < 1 || Number(address[3]) > 65535) {
         return new Response(null, { status: 503, headers: { ...REMOTE_HEADERS, "Retry-After": "15" } });
       }
@@ -223,11 +229,14 @@ export default {
         headers: { ...REMOTE_HEADERS, "Content-Type": "text/plain; charset=utf-8" },
       });
     }
-    if (mapping?.location?.startsWith("tcp://")) {
-      if (!reading || (!remoteAsset && pathname !== "/")) {
+    const storedLocation = mapping?.location ?? "";
+    const genericTCP = storedLocation.startsWith("tcp-address://");
+    if (genericTCP || storedLocation.startsWith("tcp://") || (!proxy && !httpsOnly && lookupPage)) {
+      if (!reading || (!lookupAsset && !lookupPage && pathname !== "/")) {
         return new Response(null, { status: 404, headers: NO_CACHE });
       }
-      return serveRemoteAsset(request, env, remoteAsset ? pathname : "/remote/");
+      const page = genericTCP || pathname === TCP_PAGE ? TCP_PAGE : RDP_PAGE;
+      return serveRemoteAsset(request, env, lookupAsset ? pathname : page);
     }
     if (!location || !/^https?:\/\//.test(location)) {
       return new Response(

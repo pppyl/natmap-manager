@@ -530,14 +530,13 @@ function setDraftSlug(slug) {
 }
 
 function syncCreateProtocol() {
-  const entry = createForm.querySelector("[data-create-entry]");
-  if (!entry) return;
+  const optionalEntry = createForm.querySelector("[data-tcp-entry-optional]");
+  if (!optionalEntry) return;
   const manager = createForm.elements.namedItem("target_kind")?.value === "manager";
   const tcp = !manager && createForm.elements.namedItem("scheme").value === "tcp";
   const slug = createForm.elements.namedItem("slug");
-  entry.hidden = tcp;
+  optionalEntry.hidden = !tcp;
   slug.required = !tcp;
-  slug.disabled = tcp;
   const managerFields = createForm.querySelector("[data-manager-settings]");
   if (managerFields) {
     managerFields.hidden = !manager;
@@ -698,7 +697,7 @@ async function updateStatus() {
       if (scheme) scheme.title = scheme.textContent = project.scheme_label ?? project.scheme.toUpperCase();
       row.toggleAttribute("data-rdp", Boolean(project.rdp));
       const webAccess = panel.querySelector("[data-web-access]");
-      if (webAccess) webAccess.hidden = project.scheme === "tcp" || project.rdp;
+      if (webAccess) webAccess.hidden = project.tcp;
       const remoteLink = project.remote_link ? new URL("/", project.remote_link).href : "";
       const fixedLink = remoteLink && project.fixed_link === project.remote_link ? remoteLink : project.fixed_link;
       const fixed = row.querySelector("[data-fixed-entry]");
@@ -713,7 +712,7 @@ async function updateStatus() {
         }
         if (fixedLink) {
           link.href = fixedLink;
-          link.title = project.supports_remote_lookup ? "打开远程桌面页" : fixedLink;
+          link.title = project.supports_remote_lookup ? "打开连接地址页" : fixedLink;
           setCopyAddress(button, fixedLink);
         } else if (pending) {
           link.removeAttribute("href");

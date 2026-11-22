@@ -74,7 +74,7 @@
               <td>
                 {% if project.entry %}
                   <div class="address-with-copy" data-fixed-entry>
-                    <a class="entry"{% if project.fixed_link %} href="{{ project.fixed_link }}" title="{{ '打开远程桌面页' if project.supports_remote_lookup else project.fixed_link }}"{% endif %} target="_blank" rel="noopener noreferrer">{{ project.entry | replace('https://', '') }}</a>
+                    <a class="entry"{% if project.fixed_link %} href="{{ project.fixed_link }}" title="{{ '打开连接地址页' if project.supports_remote_lookup else project.fixed_link }}"{% endif %} target="_blank" rel="noopener noreferrer">{{ project.entry | replace('https://', '') }}</a>
                     <button type="button" class="copy-address" data-copy-address="{{ project.fixed_link }}" data-address-label="固定入口" aria-label="复制固定入口" aria-live="polite"{% if not project.fixed_link %} hidden{% endif %}>复制</button>
                     <span class="hint" data-fixed-pending{% if not project.remote_lookup_status %} hidden{% endif %}>{{ project.remote_lookup_status }}</span>
                   </div>

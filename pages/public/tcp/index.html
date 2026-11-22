@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TCP 服务</title>
+  <link rel="stylesheet" href="/remote/connection.css">
+  <script src="/remote/connection.js" defer></script>
+</head>
+<body>
+  <main class="tcp-entry">
+    <header>
+      <h1>TCP 服务</h1>
+      <p id="status" class="status" role="status">正在获取连接地址…</p>
+    </header>
+    <section class="card" aria-labelledby="tcp-heading">
+      <h2 id="tcp-heading">公网连接地址</h2>
+      <div class="command-box">
+        <code id="command">—</code>
+        <button id="copy" type="button" disabled>复制连接地址</button>
+      </div>
+      <p class="hint">把公网 IP 和端口填入对应的客户端即可连接。</p>
+    </section>
+  </main>
+</body>
+</html>

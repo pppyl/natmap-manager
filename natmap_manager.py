@@ -88,6 +88,7 @@ class Project:
     manager_certificate: str = ""
     manager_private_key: str = ""
     manager_password_hash: str = field(default="", repr=False)
+    tcp_lookup_ready: bool = False
 
     def __post_init__(self):
         if not PROJECT_NAME.fullmatch(self.slug):
@@ -140,15 +141,15 @@ class Project:
 
     @property
     def ready(self):
-        return bool(self.entry) or self.scheme == "tcp"
+        return bool(self.entry) or (self.scheme == "tcp" and not self.owner)
 
     @property
     def supports_remote_lookup(self):
-        return bool(self.entry and self.owner) and self.target_port == RDP_PORT and self.scheme in ("auto", "tcp")
+        return bool(self.entry and self.owner) and self.scheme in ("auto", "tcp")
 
-    @property
-    def remote_link(self):
-        return f"{self.entry}/" if self.supports_remote_lookup and self.rdp_lookup_ready else ""
+    def remote_link(self, *, rdp):
+        ready = self.rdp_lookup_ready if rdp else self.tcp_lookup_ready
+        return f"{self.entry}/" if self.supports_remote_lookup and ready else ""
 
 
 @dataclass
@@ -268,25 +269,25 @@ class Manager:
             raise ValueError("settings.json 中缺少固定入口的更新令牌。")
         return project_token(token, project.slug) if project.owner else token
 
-    def prepare_remote_lookup(self, project):
+    def prepare_remote_lookup(self, project, rdp):
         with self.lock:
             current = self.projects.get(project.slug)
             if (self.closing.is_set() or not current or not current.supports_remote_lookup
                 or (current.entry, current.owner) != (project.entry, project.owner)):
                 return False
-            if current.remote_link:
+            if current.remote_link(rdp=rdp):
                 return True
             lookup = self.remote_lookups.setdefault(project.slug, RemoteLookup())
             if lookup.thread is None and monotonic() >= lookup.retry_at:
                 lookup.error = ""
-                lookup.thread = Thread(target=self.deploy_remote_lookup, args=(project.slug, lookup),
+                lookup.thread = Thread(target=self.deploy_remote_lookup, args=(project.slug, lookup, rdp),
                                        name=f"natmap-remote-{project.slug}", daemon=True)
                 lookup.thread.start()
             return False
 
-    def deploy_remote_lookup(self, slug, lookup):
+    def deploy_remote_lookup(self, slug, lookup, rdp):
         try:
-            self.enable_remote_lookup(slug)
+            self.enable_remote_lookup(slug, rdp=rdp)
         except (CloudflareError, OSError, ValueError, TypeError, KeyError) as error:
             message = str(error) if isinstance(error, (CloudflareError, ValueError)) else "无法读取或保存外网链接配置。"
             with self.lock:
@@ -296,16 +297,16 @@ class Manager:
                 lookup.retry_at = monotonic() + REMOTE_LOOKUP_RETRY_SECONDS
                 lookup.thread = None
 
-    def enable_remote_lookup(self, slug):
+    def enable_remote_lookup(self, slug, *, rdp):
         with self.provision_lock:
             with self.lock:
                 if self.closing.is_set():
                     raise ValueError("管理页正在退出。")
                 project = self.project(slug)
                 if not project.supports_remote_lookup:
-                    raise ValueError("外网链接需要一个由管理页创建的 Pages 项目，服务端口为 3389。")
-                if project.remote_link:
-                    return project.remote_link
+                    raise ValueError("TCP 外网链接需要一个由管理页创建的 Pages 项目。")
+                if link := project.remote_link(rdp=rdp):
+                    return link
                 platform = self.platforms.selected()
             PagesProjects(platform).deploy_remote_lookup(
                 project.slug, project.entry, project.owner, web_mode=project.web_mode, proxy_origin=project.proxy_origin,
@@ -314,9 +315,9 @@ class Manager:
                 current = self.project(slug)
                 if not current.supports_remote_lookup or (current.entry, current.owner) != (project.entry, project.owner):
                     raise ValueError("项目配置已变化，外网链接等待下次同步。")
-                updated = replace(current, rdp_lookup_ready=True)
+                updated = replace(current, rdp_lookup_ready=True, tcp_lookup_ready=True)
                 self.store(updated)
-                return updated.remote_link
+                return updated.remote_link(rdp=rdp)
 
     def set_web_access(self, slug, web_mode, proxy_origin):
         with self.provision_lock:
@@ -324,7 +325,7 @@ class Manager:
                 project = self.project(slug)
                 task = self.tasks.get(slug)
                 detected = task.detected_scheme if task and self.active(slug) else ""
-                if not project.entry or project.scheme == "tcp" or detected == "tcp":
+                if not project.entry or project.scheme == "tcp" or detected in ("tcp", "rdp"):
                     raise ValueError("固定入口方式适用于 HTTP 或 HTTPS 网页项目。")
                 if project.manager_target or web_mode == "redirect":
                     proxy_origin = project.proxy_origin
@@ -379,19 +380,19 @@ class Manager:
         task = self.tasks.get(slug)
         return bool(task and task.thread and task.thread.is_alive())
 
-    def create(self, project, draft_slug=""):
+    def create(self, project, draft_slug="", *, local_only=False):
         with self.lock:
             if self.closing.is_set():
                 raise ValueError("管理页正在退出。")
             if project.slug == self.default_slug:
                 raise ProjectInputError("slug", "这是已有项目的子域名，请使用「导入已有项目」。")
             existing = self.projects.get(project.slug)
-            if existing and (existing.ready or not existing.owner or project.scheme == "tcp"):
+            if existing and (existing.ready or not existing.owner):
                 raise ProjectInputError("slug", "该子域名已添加，请换一个子域名。")
             if self.active(project.slug):
                 raise ProjectInputError("slug", "该项目正在创建，请稍候。")
 
-            platform = self.platforms.selected() if project.scheme != "tcp" else None
+            platform = None if local_only else self.platforms.selected()
             records = self.projects.copy()
             removed_owners = self.removed_owners.copy()
             previous = records.get(draft_slug)
@@ -631,7 +632,7 @@ class Manager:
                         args, str(DEFAULT_NATMAP), redirect,
                         project="" if project.slug == self.default_slug else project.slug,
                         stop=task.stop, report=report, save_address=save_address, on_scheme=save_scheme,
-                        rdp_lookup_enabled=(lambda: self.prepare_remote_lookup(project)) if project.supports_remote_lookup else None,
+                        tcp_lookup_enabled=(lambda rdp: self.prepare_remote_lookup(project, rdp)) if project.supports_remote_lookup else None,
                         publish_via_d1=publish_via_d1 if project.entry and project.owner else None,
                     )
             with self.lock:
@@ -676,25 +677,28 @@ class Manager:
                 busy = self.active(project.slug)
                 local_port = task.bind_port if busy and task.bind_port is not None else project.bind_port
                 running = task.project if busy and task.bind_port is not None else project
+                detected = ""
+                if task and (busy or (task.project.target_port == project.target_port
+                                      and task.project.target_host == project.target_host
+                                      and task.project.scheme == project.scheme
+                                      and task.detected_scheme in ("tcp", "rdp"))):
+                    detected = task.detected_scheme
+                rdp = detected == "rdp" or (not detected and running.scheme == "tcp" and running.target_port == RDP_PORT)
+                effective_scheme = "tcp" if rdp else (detected or running.scheme)
                 scheme_label = running.scheme.upper()
-                effective_scheme = running.scheme
                 if running.scheme == "auto":
-                    detected = ""
-                    if task and (busy or (task.project.target_port == project.target_port
-                                          and task.project.target_host == project.target_host
-                                          and task.project.scheme == project.scheme
-                                          and task.detected_scheme == "tcp")):
-                        detected = task.detected_scheme
-                    effective_scheme = detected or running.scheme
-                    scheme_label = f"{detected.upper()}（自动）" if detected else "自动检测"
+                    scheme_label = f"{effective_scheme.upper()}（自动）" if detected else "自动检测"
                 changes_pending = (running.target_host, running.target_port, running.bind_port, running.scheme) != (
                     project.target_host, project.target_port, project.bind_port, project.scheme,
                 )
                 endpoint = running.target_port
                 if running.target_host != DEFAULT_TARGET_HOST:
                     endpoint = target_endpoint(running.target_host, running.target_port)
-                remote_mode = project.supports_remote_lookup and effective_scheme in ("auto", "tcp")
-                fixed_link = project.remote_link if remote_mode else (
+                tcp = effective_scheme == "tcp"
+                rdp_pending = effective_scheme == "auto" and running.target_port == RDP_PORT
+                remote_mode = project.supports_remote_lookup and (tcp or rdp_pending)
+                remote_link = project.remote_link(rdp=rdp or rdp_pending) if remote_mode else ""
+                fixed_link = remote_link if remote_mode else (
                     project.entry + "/" if project.entry and effective_scheme != "tcp" else ""
                 )
                 lookup = self.remote_lookups.get(project.slug)
@@ -713,8 +717,8 @@ class Manager:
                              "bind_port": project.bind_port, "local_port": local_port, "scheme": project.scheme,
                              "web_mode": project.web_mode, "proxy_origin": project.proxy_origin,
                              "manager_target": project.manager_target,
-                             "scheme_label": scheme_label, "rdp": effective_scheme == "tcp" and running.target_port == RDP_PORT,
-                             "show_entry": bool(fixed_link), "fixed_link": fixed_link, "remote_link": project.remote_link,
+                             "scheme_label": scheme_label, "rdp": rdp, "tcp": tcp,
+                             "show_entry": bool(fixed_link), "fixed_link": fixed_link, "remote_link": remote_link,
                              "supports_remote_lookup": remote_mode, "remote_lookup_status": lookup_status,
                              "remote_lookup_error": lookup_error,
                              "entry": project.entry, "ready": project.ready, "busy": busy,
@@ -907,12 +911,15 @@ def create_app(manager, *, remote_project=None):
                     "manager_private_key": values["manager_private_key"],
                     "manager_password_hash": remote_manager_password_hash(request.form.get("manager_password", "")),
                 }
-            slug = f"tcp-{token_hex(8)}" if values["scheme"] == "tcp" else values["slug"].strip().lower()
+            slug = values["slug"].strip().lower()
+            local_only = values["scheme"] == "tcp" and not slug
+            if local_only:
+                slug = f"tcp-{token_hex(8)}"
             project = Project(slug, **project_settings(values), web_mode=values["web_mode"],
                               proxy_origin=values["proxy_origin"], **manager_options)
             if project.manager_target:
                 remote_manager_tls(project)
-            manager.create(project, previous)
+            manager.create(project, previous, local_only=local_only)
         except ValueError as error:
             field = getattr(error, "field", "form")
             if field == "proxy_origin" and values["target_kind"] == "manager":
@@ -929,7 +936,7 @@ def create_app(manager, *, remote_project=None):
                 return jsonify(issue), 500
             return render_dashboard(open_create=True, draft_slug=previous, values=values, issue=issue), 500
         if wants_json:
-            return jsonify(draft=project.slug), 201 if project.scheme == "tcp" else 202
+            return jsonify(draft=project.slug), 201 if local_only else 202
         return redirect(url_for("new_project", draft=project.slug), code=303)
 
     @app.post("/project/save")

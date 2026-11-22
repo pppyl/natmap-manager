@@ -19,7 +19,7 @@
           <section class="rdp-command" data-remote-lookup{% if not project.supports_remote_lookup %} hidden{% endif %}>
             <h3>外网链接</h3>
             <div class="actions" data-remote-link{% if not project.remote_link %} hidden{% endif %}>
-              <a class="entry" href="{{ project.remote_link }}" target="_blank" rel="noopener noreferrer">打开远程桌面页</a>
+              <a class="entry" href="{{ project.remote_link }}" target="_blank" rel="noopener noreferrer">打开连接地址页</a>
               <button type="button" class="copy-address" data-copy-address="{{ project.remote_link }}" data-address-label="外网链接" aria-label="复制外网链接" aria-live="polite">复制</button>
             </div>
             <p class="hint" data-remote-link-status{% if not project.remote_lookup_status %} hidden{% endif %}>{{ project.remote_lookup_status }}</p>
@@ -50,7 +50,7 @@
         </form>
 
         {% if project.entry %}
-          <section class="project-more" data-web-access{% if project.scheme == 'tcp' or project.rdp %} hidden{% endif %}>
+          <section class="project-more" data-web-access{% if project.tcp %} hidden{% endif %}>
             <h3>网页固定入口</h3>
             <form method="post" action="{{ url_for('set_web_access') }}" data-web-access-form>
               <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="slug" value="{{ project.slug }}">

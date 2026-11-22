@@ -29,6 +29,8 @@ DEFAULT_TARGET_HOST = "127.0.0.1"
 ADMIN_PORT = 8765
 MAPPING_SCHEMES = ("auto", "http", "https", "tcp")
 RDP_PORT = 3389
+# Keep the original tcp:// records for existing RDP entry pages.
+TCP_ADDRESS_SCHEME = "tcp-address"
 # X.224 Connection Request with an RDP Negotiation Request for TLS and CredSSP.
 RDP_NEGOTIATION = bytes.fromhex("03 00 00 13 0e e0 00 00 00 00 00 01 00 08 00 0b 00 00 00")
 MAPPING_TARGETS = (
@@ -157,7 +159,7 @@ def publish_mapping(redirect, scheme, address, public_port, direct_url, *, syste
     except RedirectUpdateError as error:
         if publish_via_d1 is None or not error.allow_fallback:
             raise
-        location = f"tcp://{direct_url}" if scheme == "tcp" else direct_url + "/"
+        location = f"{scheme}://{direct_url}" if scheme in ("tcp", TCP_ADDRESS_SCHEME) else direct_url + "/"
         try:
             publish_via_d1(location)
         except (CloudflareError, ValueError) as fallback_error:
@@ -201,8 +203,8 @@ def detects_rdp(target_host, target_port):
 
 def detect_origin_scheme(target_port, stop, *, target_host=DEFAULT_TARGET_HOST):
     if target_port == RDP_PORT and not stop.is_set() and detects_rdp(target_host, target_port):
-        return "tcp"
-    # This loopback-only probe identifies TLS even with a local development certificate.
+        return "rdp"
+    # Detect HTTPS even when the origin uses a local development certificate.
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
@@ -220,7 +222,7 @@ def detect_origin_scheme(target_port, stop, *, target_host=DEFAULT_TARGET_HOST):
             return scheme
         except (OSError, HTTPException):
             continue
-    return None
+    return None if stop.is_set() else "tcp"
 
 
 def wait_for_origin(target_port, stop, report, *, scheme, target_host=DEFAULT_TARGET_HOST):
@@ -231,14 +233,17 @@ def wait_for_origin(target_port, stop, report, *, scheme, target_host=DEFAULT_TA
             with socket.create_connection((target_host, target_port), timeout=3):
                 pass
         except OSError:
-            service = "本地服务" if scheme == "tcp" or target_port == RDP_PORT else "本地网页服务"
+            service = "本地服务" if scheme in ("auto", "tcp") else "本地网页服务"
             message = f"等待{service} {endpoint} 启动。"
         else:
-            detected = detect_origin_scheme(target_port, stop, target_host=target_host) if scheme == "auto" else scheme
-            if detected and not stop.is_set():
-                return detected
-            protocols = "RDP、HTTP 或 HTTPS" if target_port == RDP_PORT else "HTTP 或 HTTPS"
-            message = f"本地端口 {endpoint} 已监听，暂未识别 {protocols}，将继续重试。"
+            if stop.is_set():
+                return None
+            if scheme == "auto":
+                report(f"本地端口 {endpoint} 已监听，正在检测协议。")
+                return detect_origin_scheme(target_port, stop, target_host=target_host)
+            if scheme == "tcp" and target_port == RDP_PORT and detects_rdp(target_host, target_port):
+                return "rdp"
+            return scheme
         if message != previous_message and not stop.is_set():
             report(message)
             previous_message = message
@@ -255,8 +260,8 @@ def read_natmap_output(stream, messages):
 
 
 def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None,
-                     report=log_line, save_address=save_access_address, rdp_lookup_enabled=None,
-                     publish_via_d1=None):
+                     report=log_line, save_address=save_access_address, tcp_lookup_enabled=None,
+                     publish_via_d1=None, rdp=False):
     """Run one NATMap attempt and report whether the local address could not be reused."""
     messages = Queue()
     stop = stop if stop is not None else Event()
@@ -266,6 +271,7 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
     redirected_mapping = None
     last_publish_note = ""
     direct_url = None
+    published_scheme = TCP_ADDRESS_SCHEME if scheme == "tcp" and not rdp else scheme
     refresh_redirect_at = 0
     default_port = 443 if scheme == "https" else 80
     with subprocess.Popen(
@@ -314,11 +320,11 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
 
                 if stop.is_set() or not redirect or mapping is None or time.monotonic() < refresh_redirect_at:
                     continue
-                if scheme == "tcp" and (rdp_lookup_enabled is None or not rdp_lookup_enabled()):
+                if scheme == "tcp" and (tcp_lookup_enabled is None or not tcp_lookup_enabled(rdp)):
                     continue
                 address, public_port = mapping
                 try:
-                    note = publish_mapping(redirect, scheme, address, public_port, direct_url,
+                    note = publish_mapping(redirect, published_scheme, address, public_port, direct_url,
                                            system_proxy=system_proxy, publish_via_d1=publish_via_d1)
                 except RedirectUpdateError as error:
                     refresh_redirect_at = time.monotonic() + REDIRECT_RETRY_SECONDS
@@ -330,7 +336,10 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
                     if mapping != redirected_mapping or note != last_publish_note:
                         redirected_mapping = mapping
                         last_publish_note = note
-                        message = "外网远程命令已同步。" if scheme == "tcp" else f"固定入口 {redirect[0]}/"
+                        if scheme == "tcp":
+                            message = "外网远程命令已同步。" if rdp else "TCP 外网地址已同步。"
+                        else:
+                            message = f"固定入口 {redirect[0]}/"
                         save_address(f"{message}\n直连地址 {direct_url}")
                         if note:
                             report(note)
@@ -347,7 +356,7 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
 
 
 def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
-               save_address=save_access_address, on_scheme=None, rdp_lookup_enabled=None,
+               save_address=save_access_address, on_scheme=None, tcp_lookup_enabled=None,
                publish_via_d1=None):
     stop = stop if stop is not None else Event()
     # Also detect a listener from an older launch that predates the lock.
@@ -363,30 +372,34 @@ def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
     configured_scheme = getattr(args, "scheme", None) or ("https" if args.https else "http")
     target_host = getattr(args, "target_host", DEFAULT_TARGET_HOST)
     last_scheme = None
-    track_address = bool(redirect) or configured_scheme == "tcp" or (configured_scheme == "auto" and args.target_port == RDP_PORT)
+    track_address = bool(redirect) or configured_scheme in ("auto", "tcp")
     consecutive_address_errors = 0
     try:
         for keepalive_host, stun_server in cycle(MAPPING_TARGETS):
             if track_address:
                 save_address("等待公网映射。")
-            scheme = wait_for_origin(args.target_port, stop, report, scheme=configured_scheme, target_host=target_host)
-            if scheme is None or stop.is_set():
+            detected = wait_for_origin(args.target_port, stop, report, scheme=configured_scheme, target_host=target_host)
+            if detected is None or stop.is_set():
                 break
-            mapping_redirect = redirect if scheme != "tcp" or rdp_lookup_enabled is not None else None
+            rdp = detected == "rdp"
+            scheme = "tcp" if rdp else detected
+            mapping_redirect = redirect if scheme != "tcp" or tcp_lookup_enabled is not None else None
             if track_address:
                 save_address("等待公网映射和固定入口更新。" if scheme != "tcp" and mapping_redirect else "等待公网映射。")
-            if scheme != last_scheme:
+            if detected != last_scheme:
                 if configured_scheme == "auto":
-                    if scheme == "tcp":
+                    if rdp:
                         report("已识别 Windows 远程桌面（RDP），使用 TCP 直连。")
+                    elif scheme == "tcp":
+                        report("本地端口可连接，按普通 TCP 服务建立映射。")
                     else:
                         report(f"检测到本地网页协议为 {scheme.upper()}。")
-                if mapping_redirect and scheme != "tcp":
+                if mapping_redirect:
                     route = "系统代理" if args.system_proxy else "直连"
                     report(f"固定入口上报方式 {route}。")
                 if on_scheme is not None:
-                    on_scheme(scheme)
-                last_scheme = scheme
+                    on_scheme("rdp" if rdp else scheme)
+                last_scheme = detected
             command = [
                 executable, "-4", "-k", str(KEEPALIVE_SECONDS),
                 "-s", stun_server, "-h", keepalive_host,
@@ -395,7 +408,8 @@ def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
             report(f"TCP 保活目标 {keepalive_host}:80，STUN 目标 {stun_server}。")
             address_error = maintain_mapping(command, scheme, mapping_redirect, system_proxy=args.system_proxy,
                                              stop=stop, report=report, save_address=save_address,
-                                             rdp_lookup_enabled=rdp_lookup_enabled, publish_via_d1=publish_via_d1)
+                                             tcp_lookup_enabled=tcp_lookup_enabled, publish_via_d1=publish_via_d1,
+                                             rdp=rdp)
             if stop.is_set():
                 break
             if track_address:
@@ -462,7 +476,7 @@ def main():
             project = next(item for item in projects if item.get("slug") == args.project)
             if project.get("manager_target"):
                 parser.error("NATMap 管理页项目需要从管理界面启动其 HTTPS 入口。")
-            if not project.get("entry") and project.get("scheme") != "tcp":
+            if not project.get("entry") and (project.get("scheme") != "tcp" or project.get("owner")):
                 raise ValueError
         except (OSError, ValueError, TypeError, AttributeError, StopIteration):
             parser.error("找不到已创建的项目，请检查 --project 指定的子域名。")
@@ -495,8 +509,13 @@ def main():
     if ip_address(args.target_host).is_loopback and args.target_port == ADMIN_PORT:
         parser.error("请在管理界面选择「NATMap 管理页（8765）」来创建受保护的远程入口。")
 
+    def tcp_lookup_ready(rdp):
+        key = "rdp_lookup_ready" if rdp else "tcp_lookup_ready"
+        return bool(project and project.get("entry") and project.get("owner") and project.get(key))
+
     redirect = None
-    if args.publish and getattr(args, "scheme", None) != "tcp":
+    has_tcp_entry = tcp_lookup_ready(False) or tcp_lookup_ready(True)
+    if args.publish and (getattr(args, "scheme", None) != "tcp" or has_tcp_entry):
         try:
             redirect_settings = settings["redirect"]
             entry_url = project["entry"] if project else redirect_settings["url"]
@@ -531,7 +550,8 @@ def main():
         legacy_url = redirect_settings.get("url", "") if isinstance(redirect_settings, dict) else ""
         legacy_project = project and project.get("entry") and isinstance(legacy_url, str) and project["entry"].rstrip("/") == legacy_url.rstrip("/")
         lock_project = "" if legacy_project else args.project or ""
-        return run_locked_mapping(args, executable, redirect, project=lock_project)
+        return run_locked_mapping(args, executable, redirect, project=lock_project,
+                                  tcp_lookup_enabled=tcp_lookup_ready if has_tcp_entry else None)
     except KeyboardInterrupt:
         return 0
     except OSError as error:

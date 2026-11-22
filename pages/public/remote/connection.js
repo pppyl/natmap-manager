@@ -8,10 +8,13 @@ const copyAddress = document.querySelector("#copy-address");
 const isAndroid = /\bAndroid\b/i.test(navigator.userAgent);
 
 function setConnectionAddress(address) {
-  command.textContent = address ? `mstsc /v:${address}` : "—";
+  command.textContent = address ? (openApp ? `mstsc /v:${address}` : address) : "—";
   statusText.dataset.state = address ? "available" : "offline";
-  copy.disabled = openApp.disabled = copyAddress.disabled = !address;
-  if (!address) appFallback.hidden = true;
+  copy.disabled = !address;
+  if (openApp) {
+    openApp.disabled = copyAddress.disabled = !address;
+    if (!address) appFallback.hidden = true;
+  }
 }
 
 function appUrl(address) {
@@ -24,11 +27,12 @@ function appUrl(address) {
 }
 
 async function getAddress() {
-  openApp.disabled = copyAddress.disabled = true;
+  if (openApp) openApp.disabled = copyAddress.disabled = true;
+  else copy.disabled = true;
   try {
     const response = await fetch("/_natmap/remote", { cache: "no-store" });
     if (!response.ok) {
-      statusText.textContent = "远程桌面暂未同步或已离线。";
+      statusText.textContent = openApp ? "远程桌面暂未同步或已离线。" : "TCP 服务的公网地址暂未同步或已离线。";
       setConnectionAddress("");
       return "";
     }
@@ -48,7 +52,7 @@ async function getAddress() {
   }
 }
 
-openApp.addEventListener("click", async () => {
+openApp?.addEventListener("click", async () => {
   appFallback.hidden = true;
   statusText.textContent = "正在获取最新连接地址…";
   const address = await getAddress();
@@ -72,11 +76,18 @@ async function copyText(text, message) {
   }
 }
 
-copyAddress.addEventListener("click", async () => {
+copyAddress?.addEventListener("click", async () => {
   const address = await getAddress();
   if (address) await copyText(address, "连接地址已复制，请粘贴到 Windows App 的「电脑名称」。");
 });
 
-copy.addEventListener("click", () => copyText(command.textContent, "连接命令已复制。"));
+copy.addEventListener("click", async () => {
+  if (openApp) {
+    await copyText(command.textContent, "连接命令已复制。");
+  } else {
+    const address = await getAddress();
+    if (address) await copyText(address, "连接地址已复制。");
+  }
+});
 
 getAddress();

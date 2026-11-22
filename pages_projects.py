@@ -619,10 +619,13 @@ class PagesProjects:
 
     @staticmethod
     def remote_lookup_deployed(entry):
-        request = Request(f"{entry}/remote/", method="HEAD", headers={"User-Agent": "NATMap-Manager/1.0"})
+        request = Request(f"{entry}/_natmap/remote", method="HEAD", headers={"User-Agent": "NATMap-Manager/1.0"})
         try:
             with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
-                return response.headers.get("X-NATMap-Remote-Version") == "10"
+                return response.headers.get("X-NATMap-Remote-Version") == "11"
+        except HTTPError as error:
+            with error:
+                return error.code == 503 and error.headers.get("X-NATMap-Remote-Version") == "11"
         except (OSError, ValueError):
             return False
 
