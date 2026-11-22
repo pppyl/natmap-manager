@@ -37,6 +37,7 @@
               <label>更换证书路径（PEM）<input name="manager_certificate" placeholder="留空保留证书路径"></label>
               <label>更换私钥路径（PEM）<input name="manager_private_key" placeholder="留空保留私钥路径"></label>
               {% endif %}
+              <label>登录用户名<input name="manager_username" value="{{ fields.manager_username if fields.manager_username is not none else project.manager_username }}" autocomplete="username" spellcheck="false" required></label>
               <label>更改远程管理密码<input type="password" name="manager_password" autocomplete="new-password" placeholder="留空保留密码"></label>
             {% else %}
             <label>服务监听地址{{ target_host_input(fields.target_host if fields.target_host is not none else project.target_host) }}</label>

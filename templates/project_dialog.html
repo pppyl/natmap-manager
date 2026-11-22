@@ -33,11 +33,15 @@
           {{ create_issue('target_port') }}
         </label>
         <fieldset class="create-fields" data-manager-settings{% if not manager_target %} hidden disabled{% endif %}>
+          <label>登录用户名
+            <input name="manager_username" value="{{ values.manager_username | default(default_manager_username) }}" data-default-value="{{ default_manager_username }}" autocomplete="username" spellcheck="false" {{ issue_attributes('manager_username') }} required>
+            {{ create_issue('manager_username') }}
+          </label>
           <label>远程管理密码
             <input type="password" name="manager_password" autocomplete="new-password" {{ issue_attributes('manager_password') }} required>
             {{ create_issue('manager_password') }}
           </label>
-          <p class="hint">固定网址会跳转到当前 HTTP 直连地址。登录用户名为 natmap。</p>
+          <p class="hint">固定网址会跳转到当前 HTTP 直连地址。</p>
         </fieldset>
         {% set advanced_service = not manager_target and (
           (values.target_host and values.target_host != '127.0.0.1') or values.scheme in ('http', 'https', 'tcp')

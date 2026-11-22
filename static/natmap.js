@@ -303,6 +303,8 @@ async function saveProjectEditor(event) {
     name.textContent = result.name;
     name.title = result.name;
     project.panel.querySelector("[data-editor-project]").textContent = result.name;
+    const managerUsername = form.elements.namedItem("manager_username");
+    if (managerUsername) managerUsername.value = managerUsername.value.trim();
     const managerPassword = form.elements.namedItem("manager_password");
     if (managerPassword) managerPassword.value = "";
     displayProjectOrder();
@@ -713,6 +715,8 @@ async function updateCreateForm(projects) {
     const targetKind = createForm.elements.namedItem("target_kind");
     if (targetKind) {
       targetKind.value = "service";
+      const managerUsername = createForm.elements.namedItem("manager_username");
+      managerUsername.value = managerUsername.dataset.defaultValue;
       createForm.elements.namedItem("manager_password").value = "";
     }
     const webMode = createForm.elements.namedItem("web_mode");

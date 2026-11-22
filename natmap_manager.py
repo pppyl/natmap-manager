@@ -110,6 +110,7 @@ class Project:
     tcp_group_ready: bool = False
     tcp_group_version: int = 0
     note: str = ""
+    manager_username: str = REMOTE_MANAGER_USER
 
     def __post_init__(self):
         if not PROJECT_NAME.fullmatch(self.slug):
@@ -148,6 +149,10 @@ class Project:
             if (self.target_host != DEFAULT_TARGET_HOST or self.target_port != ADMIN_PORT
                 or self.scheme not in ("http", "https")):
                 raise ProjectInputError("form", "NATMap 管理页需要使用专用的网页转发。")
+            username = self.manager_username.strip()
+            if not username or ":" in username or not username.isprintable():
+                raise ProjectInputError("manager_username", "请填写登录用户名，用户名不能包含冒号或控制字符。")
+            object.__setattr__(self, "manager_username", username)
             if not self.manager_password_hash:
                 raise ProjectInputError("manager_password", "请设置远程管理密码。")
             if self.manager_https:
@@ -556,7 +561,7 @@ class Manager:
             self.remote_lookups.pop(slug, None)
 
     def edit(self, slug, name, target_port, bind_port, scheme, target_host=None,
-             *, manager_password="", manager_certificate="", manager_private_key="", shared_entry=None):
+             *, manager_username=None, manager_password="", manager_certificate="", manager_private_key="", shared_entry=None):
         with self.lock:
             project = self.project(slug)
             if slug in self.web_access_updates:
@@ -566,6 +571,7 @@ class Manager:
             if project.manager_target:
                 updated = replace(
                     project, name=name, bind_port=bind_port,
+                    manager_username=project.manager_username if manager_username is None else manager_username,
                     manager_password_hash=(remote_manager_password_hash(manager_password) if manager_password else project.manager_password_hash),
                 )
                 if project.manager_https:
@@ -868,7 +874,7 @@ class Manager:
                              "display_target_endpoint": endpoint, "changes_pending": changes_pending,
                              "bind_port": project.bind_port, "local_port": local_port, "scheme": project.scheme,
                              "web_mode": project.web_mode, "proxy_origin": project.proxy_origin,
-                             "manager_target": project.manager_target,
+                             "manager_target": project.manager_target, "manager_username": project.manager_username,
                              "scheme_label": scheme_label, "rdp": rdp, "tcp": tcp,
                              "show_entry": bool(fixed_link), "fixed_link": fixed_link, "remote_link": remote_link,
                              "supports_remote_lookup": remote_mode, "remote_lookup_status": lookup_status,
@@ -894,6 +900,7 @@ class Manager:
 
 def create_app(manager, *, remote_project=None, remote_http=False):
     app = Flask(__name__)
+    remote_username = getattr(remote_project, "manager_username", REMOTE_MANAGER_USER)
     trusted_hosts = [remote_project.proxy_origin] if remote_project and not remote_http else [DEFAULT_TARGET_HOST, "localhost"]
     app.config.update(SECRET_KEY=token_urlsafe(32), TRUSTED_HOSTS=trusted_hosts,
                       SESSION_COOKIE_NAME="natmap_session", SESSION_COOKIE_SAMESITE="Strict", MAX_CONTENT_LENGTH=8192)
@@ -907,7 +914,7 @@ def create_app(manager, *, remote_project=None, remote_http=False):
             if not remote_http and not request.is_secure:
                 abort(403)
             auth = request.authorization
-            if (not auth or auth.type != "basic" or auth.username != REMOTE_MANAGER_USER
+            if (not auth or auth.type != "basic" or auth.username != remote_username
                 or not check_password_hash(remote_project.manager_password_hash, auth.password or "")):
                 return "", 401, {"WWW-Authenticate": 'Basic realm="NATMap", charset="UTF-8"'}
         if request.method == "POST":
@@ -944,7 +951,7 @@ def create_app(manager, *, remote_project=None, remote_http=False):
         )
         return render_template(
             "natmap.html", projects=projects, drafts=drafts,
-            note_limit=PROJECT_NOTE_LIMIT,
+            note_limit=PROJECT_NOTE_LIMIT, default_manager_username=REMOTE_MANAGER_USER,
             shared_entries=[project for project in projects if project["can_share_entry"]],
             can_import=can_import, csrf=csrf_token(), edit_issue=edit_issue, sort_mode=manager.sort_mode,
             open_create=open_create, draft=draft, values=values or draft or {"scheme": "auto"}, issue=issue,
@@ -1052,6 +1059,7 @@ def create_app(manager, *, remote_project=None, remote_http=False):
         wants_json = request.accept_mimetypes.best == "application/json"
         values = {key: request.form.get(key, "") for key in ("name", "slug", "target_port", "bind_port")}
         values["target_kind"] = request.form.get("target_kind", "service")
+        values["manager_username"] = request.form.get("manager_username", REMOTE_MANAGER_USER)
         values["shared_entry"] = request.form.get("shared_entry", "").strip().lower()
         values["target_host"] = request.form.get("target_host", DEFAULT_TARGET_HOST)
         values["scheme"] = request.form.get("scheme", "auto")
@@ -1067,6 +1075,7 @@ def create_app(manager, *, remote_project=None, remote_http=False):
                               web_mode="redirect", proxy_origin="", shared_entry="")
                 manager_options = {
                     "manager_target": True,
+                    "manager_username": values["manager_username"],
                     "manager_password_hash": remote_manager_password_hash(request.form.get("manager_password", "")),
                 }
             slug = values["slug"].strip().lower()
@@ -1096,13 +1105,15 @@ def create_app(manager, *, remote_project=None, remote_http=False):
         wants_json = request.accept_mimetypes.best == "application/json"
         slug = request.form.get("slug", "").strip().lower()
         values = {key: request.form.get(key, "") for key in ("name", "target_port", "bind_port")}
+        values["manager_username"] = request.form.get("manager_username")
         values["target_host"] = request.form.get("target_host")
         values["scheme"] = request.form.get("scheme", "http")
         share = request.form.get("shared_entry") if values["scheme"] == "tcp" else ""
         values["shared_entry"] = share.strip().lower() if share is not None else None
         try:
             restarting = manager.edit(
-                slug, **project_settings(values), manager_password=request.form.get("manager_password", ""),
+                slug, **project_settings(values), manager_username=values["manager_username"],
+                manager_password=request.form.get("manager_password", ""),
                 manager_certificate=request.form.get("manager_certificate", "").strip(),
                 manager_private_key=request.form.get("manager_private_key", "").strip(),
                 shared_entry=values["shared_entry"],
