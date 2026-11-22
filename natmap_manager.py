@@ -12,7 +12,7 @@ from secrets import token_hex, token_urlsafe
 import socket
 import ssl
 from threading import Event, Lock, RLock, Thread
-from time import monotonic
+from time import monotonic, time_ns
 from urllib.parse import urlsplit
 import webbrowser
 
@@ -21,7 +21,10 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.serving import make_server
 
 from data_storage import PROJECTS_FILE, ensure_data
-from duckdns_natmap import ADMIN_PORT, DEFAULT_NATMAP, DEFAULT_TARGET_HOST, MAPPING_SCHEMES, RDP_PORT, SETTINGS_FILE, normalize_target_host, port, run_locked_mapping, save_access_address, target_endpoint
+from duckdns_natmap import (
+    ADMIN_PORT, DEFAULT_NATMAP, DEFAULT_TARGET_HOST, MAPPING_SCHEMES, RDP_PORT, SETTINGS_FILE,
+    RedirectUpdateError, normalize_target_host, port, run_locked_mapping, save_access_address, target_endpoint,
+)
 from pages_projects import CloudflareError, LOGIN_COMMAND, PAGES_HOST, PROJECT_NAME, WEB_ACCESS_MODES, PagesNameUnavailable, PagesProjects, WranglerLogin, cloudflare_request, discover_cloudflare_connections, normalize_proxy_origin, project_token
 from platform_settings import AUTH_LABELS, PlatformProfile, PlatformSettings, pages_config, wrangler_login_status, write_json
 
@@ -89,6 +92,8 @@ class Project:
     manager_private_key: str = ""
     manager_password_hash: str = field(default="", repr=False)
     tcp_lookup_ready: bool = False
+    shared_entry: str = ""
+    tcp_group_ready: bool = False
 
     def __post_init__(self):
         if not PROJECT_NAME.fullmatch(self.slug):
@@ -110,6 +115,9 @@ class Project:
             raise ProjectInputError("bind_port", "NATMap 本地端口必须与本机服务端口不同。")
         if self.scheme not in MAPPING_SCHEMES:
             raise ProjectInputError("scheme", "请选择自动检测、HTTP、HTTPS 或 TCP。")
+        if self.shared_entry and (self.scheme != "tcp" or self.shared_entry == self.slug
+                                  or not PROJECT_NAME.fullmatch(self.shared_entry)):
+            raise ProjectInputError("shared_entry", "共享入口只适用于 TCP 项目，请选择另一个项目的固定入口。")
         if self.web_mode not in WEB_ACCESS_MODES:
             raise ProjectInputError("web_mode", "请选择 302 跳转直连或反向代理。")
         try:
@@ -147,6 +155,10 @@ class Project:
     def supports_remote_lookup(self):
         return bool(self.entry and self.owner) and self.scheme in ("auto", "tcp")
 
+    @property
+    def can_share_entry(self):
+        return self.supports_remote_lookup and self.scheme == "tcp" and not self.shared_entry
+
     def remote_link(self, *, rdp):
         ready = self.rdp_lookup_ready if rdp else self.tcp_lookup_ready
         return f"{self.entry}/" if self.supports_remote_lookup and ready else ""
@@ -179,6 +191,7 @@ class Manager:
             ensure_data()
         self.settings_file = settings_file
         self.projects_file = projects_file
+        self.resume_file = projects_file.with_name("running_projects.json")
         self.platforms = PlatformSettings(settings_file.with_name("platforms.json"))
         settings = self.read_settings()
         self.default_slug = None
@@ -198,10 +211,14 @@ class Manager:
         self.projects = {}
         self.removed_owners = {}
         self.sort_mode = "custom"
+        self.directory_revision = time_ns() // 1_000_000
         if projects_file.is_file():
             records = json.loads(projects_file.read_text(encoding="utf-8"))
             if isinstance(records, dict):
                 self.removed_owners = dict(records.get("removed_owners", {}))
+                revision = records.get("directory_revision", 0)
+                if isinstance(revision, int):
+                    self.directory_revision = max(self.directory_revision, revision)
                 if records.get("sort_mode") in PROJECT_SORT_MODES:
                     self.sort_mode = records["sort_mode"]
                 records = records["projects"]
@@ -209,6 +226,19 @@ class Manager:
                 data.pop("rdp_lookup_key", None)
                 project = Project(**data)
                 self.projects[project.slug] = project
+        self.resume_slugs = set()
+        try:
+            saved_running = json.loads(self.resume_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            print("无法读取上次的运行状态，本次请手动启动项目。", flush=True)
+        else:
+            if isinstance(saved_running, list):
+                self.resume_slugs = {
+                    slug for slug in saved_running
+                    if isinstance(slug, str) and slug in self.projects and self.projects[slug].ready
+                }
         self.tasks = {}
         self.remote_lookups = {}
         self.web_access_updates = set()
@@ -269,25 +299,54 @@ class Manager:
             raise ValueError("settings.json 中缺少固定入口的更新令牌。")
         return project_token(token, project.slug) if project.owner else token
 
+    def share_members(self, slug):
+        return [member for member in self.projects.values() if member.shared_entry == slug]
+
+    def entry_project(self, project):
+        return self.projects.get(project.shared_entry) if project.shared_entry else project
+
+    def validate_shared_entry(self, project):
+        if project.shared_entry:
+            anchor = self.entry_project(project)
+            if not anchor or not anchor.can_share_entry:
+                raise ProjectInputError("shared_entry", "请选择已有 Pages 固定入口的 TCP 项目。")
+        if self.share_members(project.slug) and not project.can_share_entry:
+            raise ProjectInputError("shared_entry", "请先把共享此入口的其他项目移出，再更改该项目的协议或入口。")
+
+    def tcp_directory(self, project, anchor):
+        with self.lock:
+            current = self.project(project.slug)
+            gateway = self.entry_project(current)
+            if not gateway or (gateway.slug, gateway.entry, gateway.owner) != (anchor.slug, anchor.entry, anchor.owner):
+                raise RedirectUpdateError("共享入口已更改，请重新启动该项目。")
+            members = self.share_members(gateway.slug)
+            if not members and not gateway.tcp_group_ready:
+                return None
+            devices = [{"id": row.slug, "name": row.name} for row in [gateway, *members]]
+            return {"device": current.slug, "directory": {"revision": self.directory_revision, "devices": devices}}
+
     def prepare_remote_lookup(self, project, rdp):
         with self.lock:
             current = self.projects.get(project.slug)
-            if (self.closing.is_set() or not current or not current.supports_remote_lookup
-                or (current.entry, current.owner) != (project.entry, project.owner)):
+            if self.closing.is_set() or not current or current.shared_entry != project.shared_entry:
                 return False
-            if current.remote_link(rdp=rdp):
+            anchor = self.entry_project(current)
+            if not anchor or not anchor.supports_remote_lookup:
+                return False
+            group = bool(self.share_members(anchor.slug))
+            if anchor.remote_link(rdp=rdp) and (not group or anchor.tcp_group_ready):
                 return True
-            lookup = self.remote_lookups.setdefault(project.slug, RemoteLookup())
+            lookup = self.remote_lookups.setdefault(anchor.slug, RemoteLookup())
             if lookup.thread is None and monotonic() >= lookup.retry_at:
                 lookup.error = ""
-                lookup.thread = Thread(target=self.deploy_remote_lookup, args=(project.slug, lookup, rdp),
-                                       name=f"natmap-remote-{project.slug}", daemon=True)
+                lookup.thread = Thread(target=self.deploy_remote_lookup, args=(anchor.slug, lookup, rdp, group),
+                                       name=f"natmap-remote-{anchor.slug}", daemon=True)
                 lookup.thread.start()
             return False
 
-    def deploy_remote_lookup(self, slug, lookup, rdp):
+    def deploy_remote_lookup(self, slug, lookup, rdp, group):
         try:
-            self.enable_remote_lookup(slug, rdp=rdp)
+            self.enable_remote_lookup(slug, rdp=rdp, group=group)
         except (CloudflareError, OSError, ValueError, TypeError, KeyError) as error:
             message = str(error) if isinstance(error, (CloudflareError, ValueError)) else "无法读取或保存外网链接配置。"
             with self.lock:
@@ -297,7 +356,7 @@ class Manager:
                 lookup.retry_at = monotonic() + REMOTE_LOOKUP_RETRY_SECONDS
                 lookup.thread = None
 
-    def enable_remote_lookup(self, slug, *, rdp):
+    def enable_remote_lookup(self, slug, *, rdp, group=False):
         with self.provision_lock:
             with self.lock:
                 if self.closing.is_set():
@@ -305,7 +364,8 @@ class Manager:
                 project = self.project(slug)
                 if not project.supports_remote_lookup:
                     raise ValueError("TCP 外网链接需要一个由管理页创建的 Pages 项目。")
-                if link := project.remote_link(rdp=rdp):
+                link = project.remote_link(rdp=rdp)
+                if link and (not group or project.tcp_group_ready):
                     return link
                 platform = self.platforms.selected()
             PagesProjects(platform).deploy_remote_lookup(
@@ -315,7 +375,8 @@ class Manager:
                 current = self.project(slug)
                 if not current.supports_remote_lookup or (current.entry, current.owner) != (project.entry, project.owner):
                     raise ValueError("项目配置已变化，外网链接等待下次同步。")
-                updated = replace(current, rdp_lookup_ready=True, tcp_lookup_ready=True)
+                updated = replace(current, rdp_lookup_ready=True, tcp_lookup_ready=True,
+                                  tcp_group_ready=current.tcp_group_ready or group)
                 self.store(updated)
                 return updated.remote_link(rdp=rdp)
 
@@ -351,11 +412,25 @@ class Manager:
 
     def save_projects(self, records, removed_owners, *, sort_mode=None):
         sort_mode = self.sort_mode if sort_mode is None else sort_mode
+        revision = max(self.directory_revision + 1, time_ns() // 1_000_000)
         write_json(self.projects_file, {"projects": [asdict(row) for row in records.values()],
-                                        "removed_owners": removed_owners, "sort_mode": sort_mode})
+                                        "removed_owners": removed_owners, "sort_mode": sort_mode,
+                                        "directory_revision": revision})
         self.projects = records
         self.removed_owners = removed_owners
         self.sort_mode = sort_mode
+        self.directory_revision = revision
+
+    def save_resume_slugs(self, slugs):
+        if slugs != self.resume_slugs:
+            write_json(self.resume_file, sorted(slugs))
+            self.resume_slugs = slugs
+
+    def forget_finished_mapping(self, slug, task):
+        try:
+            self.save_resume_slugs(self.resume_slugs - {slug})
+        except OSError:
+            task.logs.append("无法保存项目的运行状态，请检查 data 目录。")
 
     def sort_projects(self, mode, order=None):
         if mode not in PROJECT_SORT_MODES or (order is not None and mode != "custom"):
@@ -392,6 +467,7 @@ class Manager:
             if self.active(project.slug):
                 raise ProjectInputError("slug", "该项目正在创建，请稍候。")
 
+            self.validate_shared_entry(project)
             platform = None if local_only else self.platforms.selected()
             records = self.projects.copy()
             removed_owners = self.removed_owners.copy()
@@ -426,6 +502,9 @@ class Manager:
                 raise ValueError("这个项目正在更新固定入口，请稍候。")
             if self.active(slug):
                 raise ValueError("请等创建结束或停止运行后再删除配置。")
+            if self.share_members(slug):
+                raise ValueError("请先把共享此入口的其他项目移出，再删除该项目。")
+            self.save_resume_slugs(self.resume_slugs - {slug})
             records = self.projects.copy()
             records.pop(slug)
             removed_owners = self.removed_owners.copy()
@@ -436,7 +515,7 @@ class Manager:
             self.remote_lookups.pop(slug, None)
 
     def edit(self, slug, name, target_port, bind_port, scheme, target_host=None,
-             *, manager_password="", manager_certificate="", manager_private_key=""):
+             *, manager_password="", manager_certificate="", manager_private_key="", shared_entry=None):
         with self.lock:
             project = self.project(slug)
             if slug in self.web_access_updates:
@@ -453,7 +532,9 @@ class Manager:
                 remote_manager_tls(updated)
             else:
                 updated = replace(project, name=name, target_port=target_port, bind_port=bind_port, scheme=scheme,
-                                  target_host=project.target_host if target_host is None else target_host)
+                                  target_host=project.target_host if target_host is None else target_host,
+                                  shared_entry=project.shared_entry if shared_entry is None else shared_entry)
+            self.validate_shared_entry(updated)
             if not updated.ready:
                 raise ValueError("网页协议需要 Pages 入口。请新建一个网页项目。")
             task = self.tasks.get(slug)
@@ -519,15 +600,25 @@ class Manager:
                     raise ValueError("无法分配 NATMap 本地端口，请重试。") from error
             task = Task("创建中" if action == "provision" else "运行中", project, platform=platform, bind_port=bind_port)
             task.thread = Thread(target=self.work, args=(action, task), name=f"natmap-{slug}")
+            if action == "mapping":
+                self.save_resume_slugs(self.resume_slugs | {slug})
             self.tasks[slug] = task
-            task.thread.start()
+            try:
+                task.thread.start()
+            except RuntimeError as error:
+                self.tasks.pop(slug, None)
+                if action == "mapping":
+                    self.save_resume_slugs(self.resume_slugs - {slug})
+                raise ValueError("无法启动项目任务，请重试。") from error
 
-    def start_saved_projects(self):
+    def start_saved_projects(self, *, restore_only=False):
         with self.lock:
             started = failed = 0
             for project in self.projects.values():
                 if self.closing.is_set():
                     break
+                if restore_only and project.slug not in self.resume_slugs:
+                    continue
                 if not project.ready or self.active(project.slug):
                     continue
                 try:
@@ -537,6 +628,7 @@ class Manager:
                     task = Task("启动失败", project, detail=message)
                     task.logs.append(message)
                     self.tasks[project.slug] = task
+                    self.forget_finished_mapping(project.slug, task)
                     failed += 1
                 else:
                     started += 1
@@ -586,9 +678,11 @@ class Manager:
                     task.error_field = "slug"
                 task.phase = "创建失败" if action == "provision" else "启动失败"
         finally:
-            if action == "provision":
-                with self.lock:
+            with self.lock:
+                if action == "provision":
                     task.platform = None
+                elif not self.closing.is_set():
+                    self.forget_finished_mapping(project.slug, task)
 
     @contextmanager
     def mapping_target(self, project, bind_port):
@@ -619,11 +713,15 @@ class Manager:
             project = task.project
             result = 0
             if not task.stop.is_set():
-                redirect = (project.entry, self.publish_token(project)) if project.entry else None
+                with self.lock:
+                    anchor = self.entry_project(project)
+                if not anchor:
+                    raise ValueError("找不到共享入口，请在项目配置中重新选择。")
+                redirect = (anchor.entry, self.publish_token(anchor)) if anchor.entry else None
 
-                def publish_via_d1(location):
+                def publish_via_d1(location, *, tcp_group=None):
                     pages = PagesProjects(self.platforms.selected())
-                    pages.publish_mapping(project.slug, project.entry, project.owner, location)
+                    pages.publish_mapping(anchor.slug, anchor.entry, anchor.owner, location, tcp_group=tcp_group)
 
                 with self.mapping_target(project, task.bind_port) as (target_host, target_port):
                     args = Namespace(target_host=target_host, target_port=target_port,
@@ -632,8 +730,9 @@ class Manager:
                         args, str(DEFAULT_NATMAP), redirect,
                         project="" if project.slug == self.default_slug else project.slug,
                         stop=task.stop, report=report, save_address=save_address, on_scheme=save_scheme,
-                        tcp_lookup_enabled=(lambda rdp: self.prepare_remote_lookup(project, rdp)) if project.supports_remote_lookup else None,
-                        publish_via_d1=publish_via_d1 if project.entry and project.owner else None,
+                        tcp_lookup_enabled=(lambda rdp: self.prepare_remote_lookup(project, rdp)) if anchor.supports_remote_lookup else None,
+                        publish_via_d1=publish_via_d1 if anchor.entry and anchor.owner else None,
+                        tcp_group=(lambda: self.tcp_directory(project, anchor)) if anchor.supports_remote_lookup else None,
                     )
             with self.lock:
                 if task.phase != "正在重启" or self.closing.is_set():
@@ -653,21 +752,26 @@ class Manager:
                 task.logs.append("已应用新配置，正在启动打洞任务。")
 
     def stop(self, slug):
-        with self.lock:
-            if not self._request_mapping_stop(slug):
-                raise ValueError("这个项目没有可停止的打洞任务。")
-
-    def _request_mapping_stop(self, slug):
-        task = self.tasks.get(slug)
-        if not task or task.phase not in ("运行中", "正在重启") or not self.active(slug):
-            return False
-        task.phase = "正在停止"
-        task.stop.set()
-        return True
+        if not self.stop_mappings((slug,)):
+            raise ValueError("这个项目没有可停止的打洞任务。")
 
     def stop_running_projects(self):
+        return self.stop_mappings(self.tasks)
+
+    def stop_mappings(self, slugs):
         with self.lock:
-            return sum(self._request_mapping_stop(slug) for slug in self.tasks)
+            if self.closing.is_set():
+                raise ValueError("管理页正在退出。")
+            running = {
+                slug for slug in slugs
+                if self.active(slug) and self.tasks[slug].phase in ("运行中", "正在重启")
+            }
+            self.save_resume_slugs(self.resume_slugs - running)
+            for slug in running:
+                task = self.tasks[slug]
+                task.phase = "正在停止"
+                task.stop.set()
+            return len(running)
 
     def snapshot(self):
         with self.lock:
@@ -696,12 +800,16 @@ class Manager:
                     endpoint = target_endpoint(running.target_host, running.target_port)
                 tcp = effective_scheme == "tcp"
                 rdp_pending = effective_scheme == "auto" and running.target_port == RDP_PORT
-                remote_mode = project.supports_remote_lookup and (tcp or rdp_pending)
-                remote_link = project.remote_link(rdp=rdp or rdp_pending) if remote_mode else ""
+                anchor = self.entry_project(project)
+                entry = anchor.entry if anchor else ""
+                remote_mode = bool(anchor and anchor.supports_remote_lookup and (tcp or rdp_pending))
+                remote_link = anchor.remote_link(rdp=rdp or rdp_pending) if remote_mode else ""
+                if project.shared_entry and anchor and not anchor.tcp_group_ready:
+                    remote_link = ""
                 fixed_link = remote_link if remote_mode else (
-                    project.entry + "/" if project.entry and effective_scheme != "tcp" else ""
+                    entry + "/" if entry and effective_scheme != "tcp" else ""
                 )
-                lookup = self.remote_lookups.get(project.slug)
+                lookup = self.remote_lookups.get(anchor.slug) if anchor else None
                 lookup_status = ""
                 lookup_error = ""
                 if remote_mode and not fixed_link:
@@ -721,7 +829,8 @@ class Manager:
                              "show_entry": bool(fixed_link), "fixed_link": fixed_link, "remote_link": remote_link,
                              "supports_remote_lookup": remote_mode, "remote_lookup_status": lookup_status,
                              "remote_lookup_error": lookup_error,
-                             "entry": project.entry, "ready": project.ready, "busy": busy,
+                             "entry": entry, "own_entry": project.entry, "shared_entry": project.shared_entry,
+                             "can_share_entry": project.can_share_entry, "ready": project.ready, "busy": busy,
                              "phase": task.phase if task else ("待运行" if project.ready else "待创建"),
                              "detail": task.detail if task else "", "error_field": task.error_field if task else "",
                              "logs": "\n".join(task.logs) if task else ""})
@@ -785,6 +894,7 @@ def create_app(manager, *, remote_project=None):
         )
         return render_template(
             "natmap.html", projects=projects, drafts=drafts,
+            shared_entries=[project for project in projects if project["can_share_entry"]],
             can_import=can_import, csrf=csrf_token(), edit_issue=edit_issue, sort_mode=manager.sort_mode,
             open_create=open_create, draft=draft, values=values or draft or {"scheme": "auto"}, issue=issue,
         )
@@ -887,6 +997,7 @@ def create_app(manager, *, remote_project=None):
         wants_json = request.accept_mimetypes.best == "application/json"
         values = {key: request.form.get(key, "") for key in ("name", "slug", "target_port", "bind_port")}
         values["target_kind"] = request.form.get("target_kind", "service")
+        values["shared_entry"] = request.form.get("shared_entry", "").strip().lower()
         values["manager_origin"] = request.form.get("manager_origin", "")
         values["manager_certificate"] = request.form.get("manager_certificate", "").strip()
         values["manager_private_key"] = request.form.get("manager_private_key", "").strip()
@@ -912,11 +1023,11 @@ def create_app(manager, *, remote_project=None):
                     "manager_password_hash": remote_manager_password_hash(request.form.get("manager_password", "")),
                 }
             slug = values["slug"].strip().lower()
-            local_only = values["scheme"] == "tcp" and not slug
+            local_only = values["scheme"] == "tcp" and (bool(values["shared_entry"]) or not slug)
             if local_only:
                 slug = f"tcp-{token_hex(8)}"
             project = Project(slug, **project_settings(values), web_mode=values["web_mode"],
-                              proxy_origin=values["proxy_origin"], **manager_options)
+                              proxy_origin=values["proxy_origin"], shared_entry=values["shared_entry"], **manager_options)
             if project.manager_target:
                 remote_manager_tls(project)
             manager.create(project, previous, local_only=local_only)
@@ -946,11 +1057,14 @@ def create_app(manager, *, remote_project=None):
         values = {key: request.form.get(key, "") for key in ("name", "target_port", "bind_port")}
         values["target_host"] = request.form.get("target_host")
         values["scheme"] = request.form.get("scheme", "http")
+        share = request.form.get("shared_entry") if values["scheme"] == "tcp" else ""
+        values["shared_entry"] = share.strip().lower() if share is not None else None
         try:
             restarting = manager.edit(
                 slug, **project_settings(values), manager_password=request.form.get("manager_password", ""),
                 manager_certificate=request.form.get("manager_certificate", "").strip(),
                 manager_private_key=request.form.get("manager_private_key", "").strip(),
+                shared_entry=values["shared_entry"],
             )
         except ValueError as error:
             if wants_json:
@@ -1040,7 +1154,7 @@ def main():
     print(f"NATMap 管理页 {ADMIN_URL}  按 Ctrl+C 关闭。", flush=True)
     try:
         manager.wrangler_login.prepare()
-        manager.start_saved_projects()
+        manager.start_saved_projects(restore_only=True)
         webbrowser.open(ADMIN_URL)
         server.serve_forever()
     finally:

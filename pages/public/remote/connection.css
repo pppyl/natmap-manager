@@ -75,3 +75,8 @@ button:disabled { opacity: .48; cursor: default; }
 }
 .tcp-entry { max-width: 34rem; }
 .hint { color: var(--muted); margin-top: .875rem; }
+.directory-header, .device-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .75rem; }
+.device-heading h2 { min-width: 0; overflow-wrap: anywhere; }
+.device-state { color: var(--muted); font-size: .9rem; }
+.device-state[data-state="available"] { color: var(--accent); }
+.device-fallback { margin-top: .6rem; }

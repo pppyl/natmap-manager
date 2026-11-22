@@ -24,8 +24,8 @@
           </select>
           {{ create_issue('target_kind') }}
         </label>
-        <label>独立子域名<span data-tcp-entry-optional{% if values.scheme != 'tcp' or manager_target %} hidden{% endif %}>（选填）</span>
-          <span class="suffix"><input name="slug" pattern="[a-z0-9]([a-z0-9\x2D]{0,38}[a-z0-9])?" maxlength="40" placeholder="workbench" value="{{ values.slug | default('') }}" {{ issue_attributes('slug') }}{% if values.scheme != 'tcp' or manager_target %} required{% endif %}><span>.pages.dev</span></span>
+        <label data-create-slug{% if values.shared_entry %} hidden{% endif %}>独立子域名<span data-tcp-entry-optional{% if values.scheme != 'tcp' or manager_target %} hidden{% endif %}>（选填）</span>
+          <span class="suffix"><input name="slug" pattern="[a-z0-9]([a-z0-9\x2D]{0,38}[a-z0-9])?" maxlength="40" placeholder="workbench" value="{{ values.slug | default('') }}" {{ issue_attributes('slug') }}{% if values.shared_entry %} disabled{% elif values.scheme != 'tcp' or manager_target %} required{% endif %}><span>.pages.dev</span></span>
           {{ create_issue('slug') }}
         </label>
         <label data-create-target-port{% if manager_target %} hidden{% endif %}>服务端口
@@ -66,6 +66,10 @@
             <label>本地协议
               <select name="scheme" {{ issue_attributes('scheme') }}>{{ scheme_options(values.scheme) }}</select>
               {{ create_issue('scheme') }}
+            </label>
+            <label data-shared-entry-field{% if values.scheme != 'tcp' or manager_target %} hidden{% endif %}>共享固定入口
+              <select name="shared_entry" {{ issue_attributes('shared_entry') }}{% if values.scheme != 'tcp' or manager_target %} disabled{% endif %}>{{ shared_entry_options(values.shared_entry) }}</select>
+              {{ create_issue('shared_entry') }}
             </label>
             <fieldset class="create-fields" data-create-web-access{% if values.scheme == 'tcp' %} hidden disabled{% endif %}>
               <label>固定入口方式

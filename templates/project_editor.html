@@ -15,7 +15,6 @@
             <button type="button" class="copy-address" data-copy-address="" data-address-label="远程桌面命令" aria-label="复制远程桌面命令" aria-live="polite">复制</button>
           </div>
         </section>
-        {% if project.entry %}
           <section class="rdp-command" data-remote-lookup{% if not project.supports_remote_lookup %} hidden{% endif %}>
             <h3>外网链接</h3>
             <div class="actions" data-remote-link{% if not project.remote_link %} hidden{% endif %}>
@@ -25,7 +24,6 @@
             <p class="hint" data-remote-link-status{% if not project.remote_lookup_status %} hidden{% endif %}>{{ project.remote_lookup_status }}</p>
             <p class="form-error" data-remote-link-error role="status"{% if not project.remote_lookup_error %} hidden{% endif %}>{{ project.remote_lookup_error }}</p>
           </section>
-        {% endif %}
         <h3>修改配置</h3>
         <form method="post" action="{{ url_for('save_project', _anchor='project-' ~ project.slug) }}" data-edit-form>
           <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="slug" value="{{ project.slug }}">
@@ -41,7 +39,10 @@
             {% else %}
             <label>服务监听地址{{ target_host_input(fields.target_host if fields.target_host is not none else project.target_host) }}</label>
             <label>服务端口<input type="number" name="target_port" min="1" max="65535" value="{{ fields.target_port }}" required></label>
-            <label>本地协议<select name="scheme">{{ scheme_options(fields.scheme, allow_web=project.entry) }}</select></label>
+            <label>本地协议<select name="scheme">{{ scheme_options(fields.scheme, allow_web=project.own_entry) }}</select></label>
+            <label data-shared-entry-field{% if fields.scheme != 'tcp' %} hidden{% endif %}>共享固定入口
+              <select name="shared_entry" data-exclude="{{ project.slug }}"{% if fields.scheme != 'tcp' %} disabled{% endif %}>{{ shared_entry_options(fields.shared_entry, project.slug) }}</select>
+            </label>
             {% endif %}
             <label>NATMap 本地端口（选填）<input type="number" name="bind_port" min="1" max="65535" value="{{ fields.bind_port if fields.bind_port is not none else '' }}" placeholder="留空自动分配"></label>
           </div>
@@ -49,7 +50,7 @@
           <button type="submit" class="primary">保存配置</button>
         </form>
 
-        {% if project.entry %}
+        {% if project.own_entry %}
           <section class="project-more" data-web-access{% if project.tcp %} hidden{% endif %}>
             <h3>网页固定入口</h3>
             <form method="post" action="{{ url_for('set_web_access') }}" data-web-access-form>

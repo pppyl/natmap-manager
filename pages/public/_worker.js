@@ -1,15 +1,18 @@
 const UPDATE_PATH = "/_natmap";
 const COMMAND_PATH = "/_natmap/remote";
+const DEVICES_PATH = "/_natmap/tcp-devices";
 const RDP_PAGE = "/remote/";
 const TCP_PAGE = "/tcp/";
+const DEVICES_PAGE = "/remote/group/";
 const LOOKUP_ASSETS = new Set(["/remote/connection.js", "/remote/connection.css"]);
+const PROJECT_NAME = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 const LEASE_MS = 180_000;
 const NO_CACHE = { "Cache-Control": "no-store" };
 const REMOTE_HEADERS = {
   ...NO_CACHE,
   "Referrer-Policy": "no-referrer",
   "X-Robots-Tag": "noindex, nofollow",
-  "X-NATMap-Remote-Version": "11",
+  "X-NATMap-Remote-Version": "12",
 };
 const encoder = new TextEncoder();
 const WEB_PROXY_HEADERS = { "X-NATMap-Entry-Mode": "proxy" };
@@ -61,6 +64,42 @@ function parseUrl(value, base) {
   } catch {
     return null;
   }
+}
+
+function tcpEndpoint(location) {
+  const match = location?.match(/^(tcp|tcp-address):\/\/((\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5}))$/);
+  if (!match || !isPublicIPv4(match[3]) || Number(match[4]) < 1 || Number(match[4]) > 65535) return null;
+  return { address: match[2], rdp: match[1] === "tcp" };
+}
+
+function validDevices(devices, project) {
+  return Array.isArray(devices) && devices[0]?.id === project &&
+    devices.every(device => typeof device?.id === "string" && PROJECT_NAME.test(device.id)
+      && typeof device.name === "string" && device.name.trim() && [...device.name].length <= 60) &&
+    new Set(devices.map(device => device.id)).size === devices.length;
+}
+
+function readDirectory(row, project) {
+  if (!row) return [];
+  try {
+    const devices = JSON.parse(row.location);
+    return validDevices(devices, project) ? devices : [];
+  } catch {
+    return [];
+  }
+}
+
+async function deviceList(env, project) {
+  const { results } = await env.REDIRECT_DB.prepare(
+    "SELECT project, location, expires_at FROM natmap_projects WHERE project = ? OR project GLOB ?",
+  ).bind(project, `${project}/*`).all();
+  const mappings = new Map(results.map(row => [row.project, row]));
+  const now = Date.now();
+  return readDirectory(mappings.get(`${project}/`), project).map(({ id, name }) => {
+    const row = mappings.get(id === project ? project : `${project}/${id}`);
+    const endpoint = tcpEndpoint(row?.location);
+    return { id, name, address: row?.expires_at > now ? endpoint?.address ?? "" : "", rdp: endpoint?.rdp ?? false };
+  });
 }
 
 function proxyError(message) {
@@ -186,21 +225,47 @@ export default {
       } catch {
         return new Response("Invalid JSON", { status: 400, headers: NO_CACHE });
       }
-      const { ip, port, scheme } = payload ?? {};
+      const { ip, port, scheme, device, directory } = payload ?? {};
       if (!isPublicIPv4(ip) || !Number.isInteger(port) || port < 1 || port > 65535 ||
           !["http", "https", "tcp", "tcp-address"].includes(scheme) || (httpsOnly && scheme !== "https")) {
         return new Response("Invalid public IPv4, port or scheme", { status: 400, headers: NO_CACHE });
       }
+      const tcp = scheme === "tcp" || scheme === "tcp-address";
+      if ((device !== undefined || directory !== undefined) &&
+          (!PROJECT_NAME.test(project) || !validDevices(directory?.devices, project)
+           || !Number.isSafeInteger(directory.revision) || directory.revision < 1
+           || !directory.devices.some(row => row.id === device)
+           || (!tcp && (device !== project || directory.devices.length !== 1)))) {
+        return new Response("Invalid TCP device directory", { status: 400, headers: NO_CACHE });
+      }
       const target = new URL(`${scheme}://${ip}:${port}`);
-      await env.REDIRECT_DB.prepare(`
+      const key = device && device !== project ? `${project}/${device}` : project;
+      const mappingUpdate = env.REDIRECT_DB.prepare(`
         INSERT INTO natmap_projects (project, location, expires_at) VALUES (?, ?, ?)
         ON CONFLICT(project) DO UPDATE SET location = excluded.location, expires_at = excluded.expires_at
-      `).bind(project, target.href, Date.now() + LEASE_MS).run();
+      `).bind(key, target.href, Date.now() + LEASE_MS);
+      if (directory) {
+        const directoryUpdate = env.REDIRECT_DB.prepare(`
+          INSERT INTO natmap_projects (project, location, expires_at) VALUES (?, ?, ?)
+          ON CONFLICT(project) DO UPDATE SET location = excluded.location, expires_at = excluded.expires_at
+          WHERE excluded.expires_at >= natmap_projects.expires_at
+        `).bind(`${project}/`, JSON.stringify(directory.devices), directory.revision);
+        await env.REDIRECT_DB.batch([mappingUpdate, directoryUpdate]);
+      } else {
+        await mappingUpdate.run();
+      }
       return new Response(null, { status: 204, headers: NO_CACHE });
     }
 
     const proxy = env.NATMAP_WEB_MODE === "proxy";
     const reading = request.method === "GET" || request.method === "HEAD";
+    if (pathname === DEVICES_PATH) {
+      if (!reading || httpsOnly || !PROJECT_NAME.test(project)) {
+        return new Response(null, { status: 404, headers: NO_CACHE });
+      }
+      if (request.method === "HEAD") return new Response(null, { headers: REMOTE_HEADERS });
+      return Response.json(await deviceList(env, project), { headers: REMOTE_HEADERS });
+    }
     const remote = pathname === COMMAND_PATH;
     const lookupAsset = LOOKUP_ASSETS.has(pathname);
     const lookupPage = pathname === RDP_PAGE || pathname === TCP_PAGE;
@@ -213,19 +278,30 @@ export default {
     if (!proxy && !httpsOnly && !remote && !lookupPage && pathname !== "/") {
       return new Response(null, { status: 404, headers: NO_CACHE });
     }
-    const mapping = await env.REDIRECT_DB.prepare(`
-      SELECT location, expires_at FROM natmap_projects WHERE project = ?
-    `).bind(project).first();
+    let mapping;
+    if (reading && pathname === "/" && !httpsOnly && PROJECT_NAME.test(project)) {
+      const { results } = await env.REDIRECT_DB.prepare(
+        "SELECT project, location, expires_at FROM natmap_projects WHERE project IN (?, ?)",
+      ).bind(project, `${project}/`).all();
+      if (readDirectory(results.find(row => row.project === `${project}/`), project).length > 1) {
+        return serveRemoteAsset(request, env, DEVICES_PAGE);
+      }
+      mapping = results.find(row => row.project === project);
+    } else {
+      mapping = await env.REDIRECT_DB.prepare(`
+        SELECT location, expires_at FROM natmap_projects WHERE project = ?
+      `).bind(project).first();
+    }
     const location = mapping?.expires_at > Date.now() ? mapping.location : "";
     if (httpsOnly && location && !location.startsWith("https://")) {
       return proxyError("管理页入口需要 HTTPS 回源。");
     }
     if (remote) {
-      const address = location?.match(/^(?:tcp|tcp-address):\/\/((\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5}))$/);
-      if (!address || !isPublicIPv4(address[2]) || Number(address[3]) < 1 || Number(address[3]) > 65535) {
+      const endpoint = tcpEndpoint(location);
+      if (!endpoint) {
         return new Response(null, { status: 503, headers: { ...REMOTE_HEADERS, "Retry-After": "15" } });
       }
-      return new Response(request.method === "HEAD" ? null : address[1], {
+      return new Response(request.method === "HEAD" ? null : endpoint.address, {
         headers: { ...REMOTE_HEADERS, "Content-Type": "text/plain; charset=utf-8" },
       });
     }

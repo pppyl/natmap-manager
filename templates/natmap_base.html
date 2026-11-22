@@ -14,6 +14,12 @@
   <input name="target_host" value="{{ value }}" list="target-host-presets" spellcheck="false" autocomplete="off"
          placeholder="如 192.168.1.20" {{ attributes }} required>
 {%- endmacro %}
+{%- macro shared_entry_options(selected, exclude='') -%}
+  <option value="">使用独立入口或直连地址</option>
+  {% for entry in shared_entries if entry.slug != exclude %}
+  <option value="{{ entry.slug }}"{% if selected == entry.slug %} selected{% endif %}>{{ entry.name }} · {{ entry.entry | replace('https://', '') }}</option>
+  {% endfor %}
+{%- endmacro %}
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">

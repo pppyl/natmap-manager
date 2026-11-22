@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TCP 实例连接</title>
+  <link rel="stylesheet" href="/remote/connection.css">
+  <script src="/remote/connection.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="directory-header">
+        <h1>TCP 实例连接</h1>
+        <button id="refresh-devices" type="button">刷新地址</button>
+      </div>
+      <p id="status" class="status" role="status">正在获取实例…</p>
+    </header>
+    <div id="devices" class="connections"></div>
+    <section id="device-app-downloads" class="downloads" hidden>
+      <h2>下载 Windows App</h2>
+      <div class="download-links">
+        <a class="download-link" href="https://play.google.com/store/apps/details?id=com.microsoft.rdc.androidx">Google Play<span>官方商店</span></a>
+        <a class="download-link" href="https://www.apkmirror.com/apk/microsoft-corporation/microsoft-remote-desktop-preview/windows-app-11-0-26101-14228-release/windows-app-11-0-26101-14228-android-apk-download/">下载 APK<span>APKMirror</span></a>
+      </div>
+    </section>
+    <template id="device-card">
+      <section class="card">
+        <div class="device-heading">
+          <h2 data-device-name></h2>
+          <span class="device-state" data-device-state></span>
+        </div>
+        <div class="command-box">
+          <code data-device-address>—</code>
+        </div>
+        <div class="actions">
+          <button class="primary" type="button" data-action="open-app" hidden>用 Windows App 连接</button>
+          <button type="button" data-action="copy-command" hidden>复制命令</button>
+          <button type="button" data-action="copy-address">复制地址</button>
+        </div>
+        <p class="device-fallback" data-device-fallback hidden><a>再次打开 Windows App</a></p>
+      </section>
+    </template>
+  </main>
+</body>
+</html>

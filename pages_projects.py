@@ -493,7 +493,7 @@ class PagesProjects:
         database = self.account_api(token, f"/d1/database/{self.platform.database_id}")
         return database["name"]
 
-    def publish_mapping(self, name, entry, owner_id, location):
+    def publish_mapping(self, name, entry, owner_id, location, *, tcp_group=None):
         if not owner_id or not PROJECT_NAME.fullmatch(name):
             raise CloudflareError("无法确认固定入口的项目归属。")
         token = self.token()
@@ -510,11 +510,21 @@ class PagesProjects:
             database_id = str(UUID(binding.get("id") or binding.get("database_id")))
         except (AttributeError, TypeError, ValueError) as error:
             raise CloudflareError("Pages 项目缺少有效的 REDIRECT_DB 数据库绑定。") from error
-        result = self.account_api(token, f"/d1/database/{database_id}/query", method="POST", payload={
-            "sql": "INSERT INTO natmap_projects (project, location, expires_at) VALUES (?, ?, (unixepoch('now') + ?) * 1000) "
-                   "ON CONFLICT(project) DO UPDATE SET location = excluded.location, expires_at = excluded.expires_at",
-            "params": [name, location, str(MAPPING_LEASE_SECONDS)],
-        })
+        sql = "INSERT INTO natmap_projects (project, location, expires_at) VALUES (?, ?, (unixepoch('now') + ?) * 1000)"
+        params = [name, location, str(MAPPING_LEASE_SECONDS)]
+        if tcp_group:
+            device = tcp_group["device"]
+            if not PROJECT_NAME.fullmatch(device):
+                raise CloudflareError("TCP 共享入口的实例标识无效。")
+            params[0] = name if device == name else f"{name}/{device}"
+            directory = tcp_group["directory"]
+            sql += ", (?, ?, ?)"
+            params.extend([f"{name}/", json.dumps(directory["devices"], ensure_ascii=False), str(directory["revision"])])
+        sql += " ON CONFLICT(project) DO UPDATE SET location = excluded.location, expires_at = excluded.expires_at"
+        if tcp_group:
+            sql += " WHERE natmap_projects.project != ? OR excluded.expires_at >= natmap_projects.expires_at"
+            params.append(f"{name}/")
+        result = self.account_api(token, f"/d1/database/{database_id}/query", method="POST", payload={"sql": sql, "params": params})
         if not isinstance(result, list) or not result or not isinstance(result[0], dict) or not result[0].get("success"):
             raise CloudflareError("D1 未确认写入映射地址。")
 
@@ -622,10 +632,10 @@ class PagesProjects:
         request = Request(f"{entry}/_natmap/remote", method="HEAD", headers={"User-Agent": "NATMap-Manager/1.0"})
         try:
             with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
-                return response.headers.get("X-NATMap-Remote-Version") == "11"
+                return response.headers.get("X-NATMap-Remote-Version") == "12"
         except HTTPError as error:
             with error:
-                return error.code == 503 and error.headers.get("X-NATMap-Remote-Version") == "11"
+                return error.code == 503 and error.headers.get("X-NATMap-Remote-Version") == "12"
         except (OSError, ValueError):
             return False
 

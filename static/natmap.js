@@ -479,6 +479,7 @@ if (projectEditor) {
   projectEditor.addEventListener("submit", saveWebAccess);
   projectEditor.addEventListener("change", event => {
     if (event.target.name === "web_mode") syncProxyOrigin(event.target.form);
+    if (event.target.name === "scheme") syncSharedEntryField(event.target.form, event.target.value === "tcp");
   });
   document.addEventListener("keydown", event => {
     if (event.key === "Escape" && editorToggle && !createDialog?.open) {
@@ -529,14 +530,26 @@ function setDraftSlug(slug) {
   createForm.elements.namedItem("draft").value = slug;
 }
 
+function syncSharedEntryField(form, tcp) {
+  const field = form.querySelector("[data-shared-entry-field]");
+  if (!field) return "";
+  field.hidden = !tcp;
+  const select = field.querySelector("select");
+  select.disabled = !tcp;
+  return tcp ? select.value : "";
+}
+
 function syncCreateProtocol() {
   const optionalEntry = createForm.querySelector("[data-tcp-entry-optional]");
   if (!optionalEntry) return;
   const manager = createForm.elements.namedItem("target_kind")?.value === "manager";
   const tcp = !manager && createForm.elements.namedItem("scheme").value === "tcp";
   const slug = createForm.elements.namedItem("slug");
+  const shared = Boolean(syncSharedEntryField(createForm, tcp));
   optionalEntry.hidden = !tcp;
   slug.required = !tcp;
+  slug.disabled = shared;
+  createForm.querySelector("[data-create-slug]").hidden = shared;
   const managerFields = createForm.querySelector("[data-manager-settings]");
   if (managerFields) {
     managerFields.hidden = !manager;
@@ -559,6 +572,7 @@ function syncCreateProtocol() {
 if (createDialog) {
   syncCreateProtocol();
   createForm.elements.namedItem("scheme").addEventListener("change", syncCreateProtocol);
+  createForm.elements.namedItem("shared_entry")?.addEventListener("change", syncCreateProtocol);
   createForm.elements.namedItem("target_kind")?.addEventListener("change", syncCreateProtocol);
   createForm.elements.namedItem("web_mode")?.addEventListener("change", () => syncProxyOrigin(createForm));
   const open = document.querySelector("[data-open-create]");
@@ -642,6 +656,7 @@ async function updateCreateForm(projects) {
     setDraftSlug("");
     for (const name of ["name", "slug", "target_port", "bind_port"]) createForm.elements.namedItem(name).value = "";
     createForm.elements.namedItem("scheme").value = "auto";
+    createForm.elements.namedItem("shared_entry").value = "";
     const targetKind = createForm.elements.namedItem("target_kind");
     if (targetKind) {
       targetKind.value = "service";
@@ -671,11 +686,29 @@ async function updateCreateForm(projects) {
   if (createDialog) await refreshProjectList();
 }
 
+let sharedEntryOptions = "";
+function updateSharedEntryOptions(projects) {
+  const entries = projects.filter(project => project.can_share_entry);
+  const signature = JSON.stringify(entries.map(({ slug, name, entry }) => [slug, name, entry]));
+  if (signature === sharedEntryOptions) return;
+  sharedEntryOptions = signature;
+  for (const select of document.querySelectorAll('select[name="shared_entry"]')) {
+    const saved = select.value;
+    const options = entries
+      .filter(project => project.slug !== select.dataset.exclude)
+      .map(project => new Option(`${project.name} · ${project.entry.replace(/^https:\/\//, "")}`, project.slug));
+    select.replaceChildren(select.options[0].cloneNode(), ...options);
+    if (options.some(option => option.value === saved)) select.value = saved;
+  }
+  if (createForm) syncCreateProtocol();
+}
+
 async function updateStatus() {
   try {
     const response = await fetch("/status", { cache: "no-store" });
     if (!response.ok) return;
     const projects = await response.json();
+    updateSharedEntryOptions(projects);
     await updateCreateForm(projects);
     for (const project of projects) {
       const elements = projectsBySlug.get(project.slug);
@@ -705,11 +738,10 @@ async function updateStatus() {
         const link = fixed.querySelector("a");
         const button = fixed.querySelector("[data-copy-address]");
         const pending = fixed.querySelector("[data-fixed-pending]");
-        if (!pending) {
-          fixed.hidden = !(project.show_entry ?? (project.scheme !== "tcp"));
-          const empty = row.querySelector("[data-fixed-empty]");
-          if (empty) empty.hidden = !fixed.hidden;
-        }
+        fixed.hidden = !project.entry;
+        row.querySelector("[data-fixed-empty]").hidden = !fixed.hidden;
+        const hostname = project.entry.replace(/^https:\/\//, "");
+        if (link.textContent !== hostname) link.textContent = hostname;
         if (fixedLink) {
           link.href = fixedLink;
           link.title = project.supports_remote_lookup ? "打开连接地址页" : fixedLink;

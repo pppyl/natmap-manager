@@ -2,7 +2,6 @@ const statusText = document.querySelector("#status");
 const command = document.querySelector("#command");
 const openApp = document.querySelector("#open-app");
 const appFallback = document.querySelector("#app-fallback");
-const appLink = document.querySelector("#app-link");
 const copy = document.querySelector("#copy");
 const copyAddress = document.querySelector("#copy-address");
 const isAndroid = /\bAndroid\b/i.test(navigator.userAgent);
@@ -52,19 +51,23 @@ async function getAddress() {
   }
 }
 
-openApp?.addEventListener("click", async () => {
-  appFallback.hidden = true;
-  statusText.textContent = "正在获取最新连接地址…";
-  const address = await getAddress();
-  if (!address) return;
-  appLink.href = appUrl(address);
-  appFallback.hidden = false;
+function openWindowsApp(address, fallback) {
+  const link = fallback.querySelector("a");
+  link.href = appUrl(address);
+  fallback.hidden = false;
   if (navigator.userActivation?.isActive === false) {
     statusText.textContent = "已获取最新地址，请点击下方链接打开 Windows App。";
     return;
   }
   statusText.textContent = "正在打开 Windows App。";
-  appLink.click();
+  link.click();
+}
+
+openApp?.addEventListener("click", async () => {
+  appFallback.hidden = true;
+  statusText.textContent = "正在获取最新连接地址…";
+  const address = await getAddress();
+  if (address) openWindowsApp(address, appFallback);
 });
 
 async function copyText(text, message) {
@@ -81,7 +84,7 @@ copyAddress?.addEventListener("click", async () => {
   if (address) await copyText(address, "连接地址已复制，请粘贴到 Windows App 的「电脑名称」。");
 });
 
-copy.addEventListener("click", async () => {
+copy?.addEventListener("click", async () => {
   if (openApp) {
     await copyText(command.textContent, "连接命令已复制。");
   } else {
@@ -90,4 +93,85 @@ copy.addEventListener("click", async () => {
   }
 });
 
-getAddress();
+async function fetchDevices() {
+  const response = await fetch("/_natmap/tcp-devices", { cache: "no-store" });
+  if (!response.ok) throw new Error("Device directory unavailable");
+  return response.json();
+}
+
+function showDevice(card, device) {
+  card.querySelector("[data-device-name]").textContent = device.name;
+  const state = card.querySelector("[data-device-state]");
+  state.textContent = device.address ? "已同步" : "离线";
+  state.dataset.state = device.address ? "available" : "offline";
+  card.querySelector("[data-device-address]").textContent = device.address
+    ? (device.rdp ? `mstsc /v:${device.address}` : device.address) : "—";
+  for (const button of card.querySelectorAll("button[data-action]")) {
+    button.disabled = !device.address;
+    button.hidden = button.dataset.action !== "copy-address" && !device.rdp;
+  }
+}
+
+function bindDirectory(container) {
+  const template = document.querySelector("#device-card");
+  const refresh = document.querySelector("#refresh-devices");
+  const downloads = document.querySelector("#device-app-downloads");
+
+  async function update() {
+    refresh.disabled = true;
+    try {
+      const devices = await fetchDevices();
+      downloads.hidden = !devices.some(device => device.rdp);
+      container.replaceChildren(...devices.map(device => {
+        const card = template.content.firstElementChild.cloneNode(true);
+        card.dataset.deviceId = device.id;
+        showDevice(card, device);
+        return card;
+      }));
+      statusText.textContent = devices.length ? "已获取实例连接地址。" : "暂无实例，请在管理页运行 TCP 项目。";
+    } catch {
+      statusText.textContent = "暂时无法获取实例，请重试。";
+    } finally {
+      refresh.disabled = false;
+    }
+  }
+
+  container.addEventListener("click", async event => {
+    const button = event.target.closest("button[data-action]");
+    if (!button || button.disabled) return;
+    const card = button.closest("[data-device-id]");
+    const fallback = card.querySelector("[data-device-fallback]");
+    fallback.hidden = true;
+    button.disabled = true;
+    try {
+      const device = (await fetchDevices()).find(item => item.id === card.dataset.deviceId);
+      if (!device) {
+        card.remove();
+        statusText.textContent = "该实例已移出共享入口。";
+        return;
+      }
+      showDevice(card, device);
+      if (!device.address) {
+        statusText.textContent = "该实例暂未同步或已离线。";
+        return;
+      }
+      if (button.dataset.action === "open-app" && device.rdp) {
+        openWindowsApp(device.address, fallback);
+      } else if (button.dataset.action === "copy-command" && device.rdp) {
+        await copyText(`mstsc /v:${device.address}`, "连接命令已复制。");
+      } else {
+        await copyText(device.address, "连接地址已复制。");
+      }
+    } catch {
+      button.disabled = false;
+      statusText.textContent = "暂时无法获取连接地址，请重试。";
+    }
+  });
+
+  refresh.addEventListener("click", update);
+  update();
+}
+
+const devices = document.querySelector("#devices");
+if (devices) bindDirectory(devices);
+else getAddress();

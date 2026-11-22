@@ -109,10 +109,13 @@ class NoUpdateRedirect(HTTPRedirectHandler):
         return None
 
 
-def update_redirect(url, token, scheme, address, public_port, *, system_proxy=False):
+def update_redirect(url, token, scheme, address, public_port, *, system_proxy=False, tcp_group=None):
+    payload = {"ip": str(address), "port": public_port, "scheme": scheme}
+    if tcp_group:
+        payload.update(tcp_group)
     request = Request(
         f"{url}/_natmap",
-        data=json.dumps({"ip": str(address), "port": public_port, "scheme": scheme}).encode("utf-8"),
+        data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -153,15 +156,18 @@ def update_redirect(url, token, scheme, address, public_port, *, system_proxy=Fa
         raise RedirectUpdateError(message, allow_fallback=True) from error
 
 
-def publish_mapping(redirect, scheme, address, public_port, direct_url, *, system_proxy, publish_via_d1):
+def publish_mapping(redirect, scheme, address, public_port, direct_url, *, system_proxy, publish_via_d1, tcp_group=None):
     try:
-        update_redirect(*redirect, scheme, address, public_port, system_proxy=system_proxy)
+        update_redirect(*redirect, scheme, address, public_port, system_proxy=system_proxy, tcp_group=tcp_group)
     except RedirectUpdateError as error:
         if publish_via_d1 is None or not error.allow_fallback:
             raise
         location = f"{scheme}://{direct_url}" if scheme in ("tcp", TCP_ADDRESS_SCHEME) else direct_url + "/"
         try:
-            publish_via_d1(location)
+            if tcp_group:
+                publish_via_d1(location, tcp_group=tcp_group)
+            else:
+                publish_via_d1(location)
         except (CloudflareError, ValueError) as fallback_error:
             raise RedirectUpdateError(f"{error} D1 同步失败。{fallback_error}") from fallback_error
         except (OSError, KeyError, TypeError) as fallback_error:
@@ -261,7 +267,7 @@ def read_natmap_output(stream, messages):
 
 def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None,
                      report=log_line, save_address=save_access_address, tcp_lookup_enabled=None,
-                     publish_via_d1=None, rdp=False):
+                     publish_via_d1=None, rdp=False, tcp_group=None):
     """Run one NATMap attempt and report whether the local address could not be reused."""
     messages = Queue()
     stop = stop if stop is not None else Event()
@@ -322,10 +328,13 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
                     continue
                 if scheme == "tcp" and (tcp_lookup_enabled is None or not tcp_lookup_enabled(rdp)):
                     continue
+                if stop.is_set():
+                    continue
                 address, public_port = mapping
                 try:
                     note = publish_mapping(redirect, published_scheme, address, public_port, direct_url,
-                                           system_proxy=system_proxy, publish_via_d1=publish_via_d1)
+                                           system_proxy=system_proxy, publish_via_d1=publish_via_d1,
+                                           tcp_group=tcp_group() if tcp_group else None)
                 except RedirectUpdateError as error:
                     refresh_redirect_at = time.monotonic() + REDIRECT_RETRY_SECONDS
                     redirected_mapping = None
@@ -357,7 +366,7 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
 
 def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
                save_address=save_access_address, on_scheme=None, tcp_lookup_enabled=None,
-               publish_via_d1=None):
+               publish_via_d1=None, tcp_group=None):
     stop = stop if stop is not None else Event()
     # Also detect a listener from an older launch that predates the lock.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -409,7 +418,7 @@ def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
             address_error = maintain_mapping(command, scheme, mapping_redirect, system_proxy=args.system_proxy,
                                              stop=stop, report=report, save_address=save_address,
                                              tcp_lookup_enabled=tcp_lookup_enabled, publish_via_d1=publish_via_d1,
-                                             rdp=rdp)
+                                             rdp=rdp, tcp_group=tcp_group)
             if stop.is_set():
                 break
             if track_address:
@@ -465,7 +474,9 @@ def main():
     parser.add_argument("--https", action="store_true", help="本地服务已启用 HTTPS 时，显示 HTTPS 链接")
     args = parser.parse_args()
 
-    project = None
+    project = anchor = None
+    projects = []
+    project_data = {}
     if args.project:
         args.project = args.project.strip().lower()
         if not PROJECT_NAME.fullmatch(args.project):
@@ -474,6 +485,11 @@ def main():
             project_data = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
             projects = project_data.get("projects", []) if isinstance(project_data, dict) else project_data
             project = next(item for item in projects if item.get("slug") == args.project)
+            shared_entry = project.get("shared_entry")
+            anchor = next(item for item in projects if item.get("slug") == shared_entry) if shared_entry else project
+            if shared_entry and (not anchor.get("entry") or not anchor.get("owner") or anchor.get("scheme") != "tcp"
+                                 or anchor.get("shared_entry")):
+                parser.error("共享入口无效，请在管理页中重新选择。")
             if project.get("manager_target"):
                 parser.error("NATMap 管理页项目需要从管理界面启动其 HTTPS 入口。")
             if not project.get("entry") and (project.get("scheme") != "tcp" or project.get("owner")):
@@ -511,14 +527,23 @@ def main():
 
     def tcp_lookup_ready(rdp):
         key = "rdp_lookup_ready" if rdp else "tcp_lookup_ready"
-        return bool(project and project.get("entry") and project.get("owner") and project.get(key))
+        return bool(anchor and anchor.get("entry") and anchor.get("owner") and anchor.get(key))
 
+    tcp_group = None
+    if args.publish and anchor:
+        members = [row for row in projects if row.get("shared_entry") == anchor["slug"]]
+        if members and not anchor.get("tcp_group_ready"):
+            parser.error("共享入口尚未部署，请先在管理页运行任意组内项目。")
+        if anchor.get("tcp_group_ready"):
+            devices = [{"id": row["slug"], "name": row["name"]} for row in [anchor, *members]]
+            tcp_group = {"device": project["slug"],
+                         "directory": {"revision": project_data["directory_revision"], "devices": devices}}
     redirect = None
     has_tcp_entry = tcp_lookup_ready(False) or tcp_lookup_ready(True)
     if args.publish and (getattr(args, "scheme", None) != "tcp" or has_tcp_entry):
         try:
             redirect_settings = settings["redirect"]
-            entry_url = project["entry"] if project else redirect_settings["url"]
+            entry_url = anchor["entry"] if anchor else redirect_settings["url"]
             entry = urlsplit(entry_url)
             redirect_token = redirect_settings["token"]
             if (
@@ -532,8 +557,8 @@ def main():
             ):
                 raise ValueError
             redirect_token = redirect_token.strip()
-            if project and project.get("owner"):
-                redirect_token = project_token(redirect_token, args.project)
+            if anchor and anchor.get("owner"):
+                redirect_token = project_token(redirect_token, anchor["slug"])
             redirect = (f"https://{entry.hostname}", redirect_token)
         except (KeyError, TypeError, AttributeError, ValueError):
             parser.error("发布模式需要有效的固定入口和更新令牌。请用 --project 指定已保存的项目。")
@@ -551,7 +576,8 @@ def main():
         legacy_project = project and project.get("entry") and isinstance(legacy_url, str) and project["entry"].rstrip("/") == legacy_url.rstrip("/")
         lock_project = "" if legacy_project else args.project or ""
         return run_locked_mapping(args, executable, redirect, project=lock_project,
-                                  tcp_lookup_enabled=tcp_lookup_ready if has_tcp_entry else None)
+                                  tcp_lookup_enabled=tcp_lookup_ready if has_tcp_entry else None,
+                                  tcp_group=(lambda: tcp_group) if tcp_group else None)
     except KeyboardInterrupt:
         return 0
     except OSError as error:
