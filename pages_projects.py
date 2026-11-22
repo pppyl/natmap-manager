@@ -29,6 +29,7 @@ WRANGLER_AUTH_TIMEOUT = 300
 WRANGLER_SPEC_DIR = Path(__file__).parent / "tools" / "wrangler"
 PROJECT_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?\Z")
 PAGES_HOST = re.compile(r"[a-z0-9-]+\.pages\.dev\Z")
+WEB_ACCESS_MODES = ("redirect", "proxy")
 MAPPING_LEASE_SECONDS = 180  # Keep this aligned with LEASE_MS in the Pages function.
 
 
@@ -47,6 +48,23 @@ LOGIN_COMMAND = (
 
 def project_token(base_token, project):
     return hmac.digest(base_token.encode(), f"pages:{project}".encode(), "sha256").hex()
+
+
+def normalize_proxy_origin(value):
+    if not isinstance(value, str):
+        raise ValueError("请输入 HTTPS 回源域名。")
+    host = value.strip().rstrip(".").lower()
+    if not host:
+        return ""
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError as error:
+        raise ValueError("请输入 HTTPS 回源域名，端口由 NATMap 自动提供。") from error
+    if (len(host) > 253 or not re.fullmatch(
+        r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", host,
+    )):
+        raise ValueError("请输入 HTTPS 回源域名，端口由 NATMap 自动提供。")
+    return host
 
 
 class CloudflareError(RuntimeError):
@@ -500,8 +518,8 @@ class PagesProjects:
         if not isinstance(result, list) or not result or not isinstance(result[0], dict) or not result[0].get("success"):
             raise CloudflareError("D1 未确认写入映射地址。")
 
-    def prepare_database(self, token):
-        if self.platform.database_id == self.legacy_database:
+    def prepare_database(self, token, *, check_legacy=False):
+        if self.platform.database_id == self.legacy_database and not check_legacy:
             return
         path = f"/d1/database/{self.platform.database_id}/query"
         tables = self.account_api(token, path, method="POST", payload={
@@ -526,8 +544,10 @@ class PagesProjects:
             raise CloudflareError("无法确认临时项目仍为空项目。")
         self.api(token, f"/{name}", method="DELETE", missing_ok=True)
 
-    def deploy(self, name, owner_id, branch):
-        public_vars = {"NATMAP_PROJECT": name, "NATMAP_MANAGER_ID": owner_id}
+    def deploy(self, name, owner_id, branch, *, web_mode="redirect", proxy_origin="", record_name=None, https_only=False):
+        public_vars = {"NATMAP_PROJECT": name if record_name is None else record_name,
+                       "NATMAP_MANAGER_ID": owner_id, "NATMAP_WEB_MODE": web_mode,
+                       "NATMAP_PROXY_ORIGIN": proxy_origin, "NATMAP_HTTPS_ONLY": "1" if https_only else "0"}
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(prefix="natmap-pages-", dir=TEMP_DIR) as directory:
             folder = Path(directory)
@@ -543,12 +563,47 @@ class PagesProjects:
         env_vars = production.get("env_vars") or {}
         database = (production.get("d1_databases") or {}).get("REDIRECT_DB") or {}
         return (
-            project.get("subdomain") == host and has_project_owner(project, owner_id)
+            project.get("subdomain") == host
+            and ((env_vars.get("NATMAP_MANAGER_ID") or {}).get("value") or "") == owner_id
             and (env_vars.get("REDIRECT_TOKEN") or {}).get("type") == "secret_text"
             and (database.get("id") or database.get("database_id")) == self.platform.database_id
         )
 
-    def deploy_remote_lookup(self, name, entry, owner_id):
+    @staticmethod
+    def matches_web_access(project, web_mode, proxy_origin, *, https_only=False):
+        production = (project.get("deployment_configs") or {}).get("production") or {}
+        variables = production.get("env_vars") or {}
+        return (
+            (variables.get("NATMAP_WEB_MODE") or {}).get("value") == web_mode
+            and ((variables.get("NATMAP_PROXY_ORIGIN") or {}).get("value") or "") == proxy_origin
+            and ((variables.get("NATMAP_HTTPS_ONLY") or {}).get("value") == "1") == https_only
+        )
+
+    def set_web_access(self, name, entry, owner_id, web_mode, proxy_origin, *, https_only=False):
+        token = self.token()
+        host = urlsplit(entry).hostname
+        project = self.api(token, f"/{name}", missing_ok=True)
+        if not project or not self.matches_deployment(project, host, owner_id):
+            raise CloudflareError("请在平台配置中选择这个 Pages 项目原来的账号和 D1 连接。")
+        branch = project.get("production_branch")
+        if not branch:
+            raise CloudflareError("Pages 项目没有可确认的生产分支。")
+        variables = project["deployment_configs"]["production"].get("env_vars") or {}
+        if self.matches_web_access(project, web_mode, proxy_origin, https_only=https_only):
+            return
+        record_name = (variables.get("NATMAP_PROJECT") or {}).get("value") or ""
+        if owner_id and record_name != name:
+            raise CloudflareError("Pages 项目的映射记录名称不匹配，请检查生产部署。")
+        if not owner_id:
+            self.prepare_database(token, check_legacy=True)
+        self.deploy(name, owner_id, branch, web_mode=web_mode, proxy_origin=proxy_origin,
+                    record_name=record_name, https_only=https_only)
+        deployed = self.api(self.token(), f"/{name}")
+        if (not self.matches_deployment(deployed, host, owner_id)
+            or not self.matches_web_access(deployed, web_mode, proxy_origin, https_only=https_only)):
+            raise CloudflareError("Pages 尚未确认入口方式更新，请重试。")
+
+    def deploy_remote_lookup(self, name, entry, owner_id, *, web_mode="redirect", proxy_origin=""):
         token = self.token()
         project = self.api(token, f"/{name}", missing_ok=True)
         host = urlsplit(entry).netloc
@@ -558,7 +613,7 @@ class PagesProjects:
             raise CloudflareError("这个 Pages 项目的生产分支已变更，请在 Cloudflare 中检查项目配置。")
         if self.remote_lookup_deployed(entry):
             return
-        self.deploy(name, owner_id, "main")
+        self.deploy(name, owner_id, "main", web_mode=web_mode, proxy_origin=proxy_origin)
         if not self.matches_deployment(self.api(self.token(), f"/{name}"), host, owner_id):
             raise CloudflareError("外网链接部署后校验失败，请重试。")
 
@@ -567,11 +622,11 @@ class PagesProjects:
         request = Request(f"{entry}/remote/", method="HEAD", headers={"User-Agent": "NATMap-Manager/1.0"})
         try:
             with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
-                return response.headers.get("X-NATMap-Remote-Version") == "3"
+                return response.headers.get("X-NATMap-Remote-Version") == "10"
         except (OSError, ValueError):
             return False
 
-    def provision(self, name, owner_id, redirect_token):
+    def provision(self, name, owner_id, redirect_token, *, web_mode="redirect", proxy_origin="", https_only=False):
         if not PROJECT_NAME.fullmatch(name):
             raise ValueError("无效的 Pages 项目名称。")
 
@@ -604,9 +659,10 @@ class PagesProjects:
             raise PagesNameUnavailable(message)
 
         self.prepare_database(token)
-        self.deploy(name, owner_id, "main")
+        self.deploy(name, owner_id, "main", web_mode=web_mode, proxy_origin=proxy_origin, https_only=https_only)
 
         deployed = self.api(self.token(), f"/{name}")
-        if not self.matches_deployment(deployed, expected_host, owner_id):
+        if (not self.matches_deployment(deployed, expected_host, owner_id)
+            or not self.matches_web_access(deployed, web_mode, proxy_origin, https_only=https_only)):
             raise CloudflareError("Pages 配置校验失败，请重试创建。")
         return f"https://{expected_host}"

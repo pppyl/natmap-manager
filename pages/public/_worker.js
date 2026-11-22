@@ -6,9 +6,10 @@ const REMOTE_HEADERS = {
   ...NO_CACHE,
   "Referrer-Policy": "no-referrer",
   "X-Robots-Tag": "noindex, nofollow",
-  "X-NATMap-Remote-Version": "3",
+  "X-NATMap-Remote-Version": "10",
 };
 const encoder = new TextEncoder();
+const WEB_PROXY_HEADERS = { "X-NATMap-Entry-Mode": "proxy" };
 
 function isPublicIPv4(ip) {
   if (typeof ip !== "string") return false;
@@ -51,10 +52,127 @@ async function serveRemoteAsset(request, env, pathname) {
   return new Response(asset.body, { status: asset.status, headers });
 }
 
+function parseUrl(value, base) {
+  try {
+    return new URL(value, base);
+  } catch {
+    return null;
+  }
+}
+
+function proxyError(message) {
+  return new Response(message, {
+    status: 502,
+    headers: { ...NO_CACHE, ...WEB_PROXY_HEADERS, "Content-Type": "text/plain; charset=utf-8" },
+  });
+}
+
+async function resolveOriginAddresses(host, type) {
+  const url = new URL("https://cloudflare-dns.com/dns-query");
+  url.searchParams.set("name", host);
+  url.searchParams.set("type", type);
+  const response = await fetch(url, {
+    headers: { Accept: "application/dns-json" }, redirect: "manual",
+  });
+  if (!response.ok) throw new Error("DNS lookup failed");
+  const result = await response.json();
+  if (result.Status !== 0) throw new Error("DNS lookup failed");
+  return result.Answer ?? [];
+}
+
+async function webUpstream(visitor, origin, env) {
+  const upstream = new URL(origin);
+  if (origin.protocol === "https:") {
+    const hostname = env.NATMAP_PROXY_ORIGIN;
+    if (!hostname || hostname === visitor.hostname) {
+      throw new Error("请在项目设置中填写与目标服务证书匹配的 HTTPS 回源域名。");
+    }
+    let addresses;
+    try {
+      addresses = await Promise.all([
+        resolveOriginAddresses(hostname, "A"), resolveOriginAddresses(hostname, "AAAA"),
+      ]);
+    } catch {
+      throw new Error("暂时无法解析 HTTPS 回源域名。");
+    }
+    const [ipv4, ipv6] = addresses;
+    const aRecords = ipv4.filter(record => record.type === 1);
+    if (!aRecords.length || aRecords.some(record => record.data !== origin.hostname)
+        || ipv6.some(record => record.type === 28)) {
+      throw new Error("HTTPS 回源域名的 DNS 记录需要指向当前 NATMap 公网 IPv4。");
+    }
+    upstream.hostname = hostname;
+  } else {
+    upstream.hostname = origin.hostname.replaceAll(".", "-") + ".sslip.io";
+  }
+  upstream.pathname = visitor.pathname;
+  upstream.search = visitor.search;
+  return upstream;
+}
+
+async function proxyWeb(request, visitor, origin, upstream) {
+  const headers = new Headers(request.headers);
+  headers.set("Host", origin.protocol === "https:" ? upstream.host : origin.host);
+  headers.set("X-Forwarded-Host", visitor.host);
+  headers.set("X-Forwarded-Proto", visitor.protocol.slice(0, -1));
+  headers.delete("Forwarded");
+  headers.delete("X-Forwarded-Port");
+  headers.delete("X-Forwarded-For");
+  const clientIp = request.headers.get("CF-Connecting-IP");
+  if (clientIp) headers.set("X-Forwarded-For", clientIp);
+
+  let response;
+  try {
+    response = await fetch(upstream, {
+      method: request.method, headers, body: request.body,
+      redirect: "manual", cache: "no-store",
+    });
+  } catch {
+    return proxyError("暂时无法连接目标网页服务，请检查公网映射和回源证书。");
+  }
+  if (response.status === 101) return response;
+
+  const output = new Headers(response.headers);
+  const location = output.get("Location");
+  if (location && /^(?:https?:)?\/\//i.test(location)) {
+    const redirect = parseUrl(location, upstream);
+    if (redirect && [origin.host, upstream.host, visitor.host].includes(redirect.host)) {
+      const result = new URL(visitor.origin);
+      result.pathname = redirect.pathname;
+      result.search = redirect.search;
+      result.hash = redirect.hash;
+      output.set("Location", result.href);
+    }
+  }
+  const cookies = output.getAll("Set-Cookie");
+  if (cookies.length) {
+    output.delete("Set-Cookie");
+    for (const cookie of cookies) {
+      const adjusted = cookie.replace(/;\s*Domain\s*=\s*([^;]+)/i, (attribute, domain) => {
+        const host = domain.trim().toLowerCase().replace(/^\./, "");
+        return host === upstream.hostname || host === origin.hostname ? "" : attribute;
+      });
+      output.append("Set-Cookie", adjusted);
+    }
+  }
+  output.set("X-NATMap-Entry-Mode", "proxy");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers: output });
+}
+
+function redirectWeb(location) {
+  return new Response(null, { status: 302, headers: { ...NO_CACHE, Location: location, "X-NATMap-Entry-Mode": "redirect" } });
+}
+
 export default {
   async fetch(request, env) {
-    const { pathname } = new URL(request.url);
+    const visitor = new URL(request.url);
+    const { pathname } = visitor;
     const project = env.NATMAP_PROJECT ?? "";
+    const httpsOnly = env.NATMAP_HTTPS_ONLY === "1";
+    if (httpsOnly && visitor.protocol !== "https:") {
+      visitor.protocol = "https:";
+      return new Response(null, { status: 308, headers: { ...NO_CACHE, Location: visitor.href } });
+    }
     if (pathname === UPDATE_PATH && request.method === "PUT") {
       if (!authorized(request, env.REDIRECT_TOKEN)) {
         return new Response(null, { status: 401, headers: NO_CACHE });
@@ -67,7 +185,7 @@ export default {
       }
       const { ip, port, scheme } = payload ?? {};
       if (!isPublicIPv4(ip) || !Number.isInteger(port) || port < 1 || port > 65535 ||
-          !["http", "https", "tcp"].includes(scheme)) {
+          !["http", "https", "tcp"].includes(scheme) || (httpsOnly && scheme !== "https")) {
         return new Response("Invalid public IPv4, port or scheme", { status: 400, headers: NO_CACHE });
       }
       const target = new URL(`${scheme}://${ip}:${port}`);
@@ -78,18 +196,24 @@ export default {
       return new Response(null, { status: 204, headers: NO_CACHE });
     }
 
-    if (request.method !== "GET" && request.method !== "HEAD") {
+    const proxy = env.NATMAP_WEB_MODE === "proxy";
+    const reading = request.method === "GET" || request.method === "HEAD";
+    const remote = pathname === COMMAND_PATH;
+    const remoteAsset = pathname === "/remote/" || pathname === "/remote/connection.js";
+    if (pathname === UPDATE_PATH || (!reading && (remote || !proxy))) {
       return new Response(null, { status: 404, headers: NO_CACHE });
     }
-    if (pathname === "/remote/" || pathname === "/remote/connection.js") {
+    if (!proxy && !httpsOnly && remoteAsset) {
       return serveRemoteAsset(request, env, pathname);
     }
-    const remote = pathname === COMMAND_PATH;
-    if (!remote && pathname !== "/") return new Response(null, { status: 404, headers: NO_CACHE });
+    if (!proxy && !httpsOnly && !remote && pathname !== "/") return new Response(null, { status: 404, headers: NO_CACHE });
     const mapping = await env.REDIRECT_DB.prepare(`
       SELECT location, expires_at FROM natmap_projects WHERE project = ?
     `).bind(project).first();
     const location = mapping?.expires_at > Date.now() ? mapping.location : "";
+    if (httpsOnly && location && !location.startsWith("https://")) {
+      return proxyError("管理页入口需要 HTTPS 回源。");
+    }
     if (remote) {
       const address = location?.match(/^tcp:\/\/((\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5}))$/);
       if (!address || !isPublicIPv4(address[2]) || Number(address[3]) < 1 || Number(address[3]) > 65535) {
@@ -100,7 +224,10 @@ export default {
       });
     }
     if (mapping?.location?.startsWith("tcp://")) {
-      return serveRemoteAsset(request, env, "/remote/");
+      if (!reading || (!remoteAsset && pathname !== "/")) {
+        return new Response(null, { status: 404, headers: NO_CACHE });
+      }
+      return serveRemoteAsset(request, env, remoteAsset ? pathname : "/remote/");
     }
     if (!location || !/^https?:\/\//.test(location)) {
       return new Response(
@@ -111,6 +238,17 @@ export default {
         },
       );
     }
-    return new Response(null, { status: 302, headers: { ...NO_CACHE, Location: location } });
+    if (proxy || httpsOnly) {
+      const origin = parseUrl(location);
+      if (!origin || !isPublicIPv4(origin.hostname)) return proxyError("暂无有效的公网回源地址。");
+      let upstream;
+      try {
+        upstream = await webUpstream(visitor, origin, env);
+      } catch (error) {
+        return proxyError(error.message);
+      }
+      return proxy ? proxyWeb(request, visitor, origin, upstream) : redirectWeb(upstream.href);
+    }
+    return redirectWeb(location);
   },
 };

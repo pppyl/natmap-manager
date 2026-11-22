@@ -4,6 +4,11 @@
   <div class="section-heading project-toolbar">
     <h2 id="projects-heading">项目</h2>
     <div class="actions">
+      <form class="actions" method="post" action="{{ url_for('change', action='start-all') }}" data-batch-actions{% if not projects %} hidden{% endif %}>
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit" class="secondary">全部启动</button>
+        <button type="submit" class="secondary" formaction="{{ url_for('change', action='stop-all') }}">全部停止</button>
+      </form>
       <form class="actions project-sort" method="post" action="{{ url_for('sort_projects') }}" data-project-sort hidden>
         <input type="hidden" name="csrf" value="{{ csrf }}">
         <select name="mode" aria-label="项目排序">
@@ -55,7 +60,7 @@
         {% for project in projects %}
           {% set edit_open = edit_issue and edit_issue.slug == project.slug %}
           <tbody>
-            <tr id="project-{{ project.slug }}" data-project="{{ project.slug }}"{% if project.rdp %} data-rdp{% endif %}>
+            <tr id="project-{{ project.slug }}" data-project="{{ project.slug }}"{% if project.rdp %} data-rdp{% endif %}{% if project.manager_target %} data-manager-target{% endif %}>
               <th scope="row" class="project-name">
                 <span data-project-name title="{{ project.name }}">{{ project.name }}</span>
                 <div class="project-order" data-order-controls hidden>

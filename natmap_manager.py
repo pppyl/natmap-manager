@@ -2,6 +2,7 @@
 
 from argparse import ArgumentTypeError, Namespace
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 import hmac
 from ipaddress import ip_address
@@ -9,24 +10,26 @@ import json
 from pathlib import Path
 from secrets import token_hex, token_urlsafe
 import socket
+import ssl
 from threading import Event, Lock, RLock, Thread
 from time import monotonic
 from urllib.parse import urlsplit
 import webbrowser
 
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.serving import make_server
 
 from data_storage import PROJECTS_FILE, ensure_data
-from duckdns_natmap import DEFAULT_NATMAP, DEFAULT_TARGET_HOST, MAPPING_SCHEMES, RDP_PORT, SETTINGS_FILE, normalize_target_host, port, run_locked_mapping, save_access_address, target_endpoint
-from pages_projects import CloudflareError, LOGIN_COMMAND, PAGES_HOST, PROJECT_NAME, PagesNameUnavailable, PagesProjects, WranglerLogin, cloudflare_request, discover_cloudflare_connections, project_token
+from duckdns_natmap import ADMIN_PORT, DEFAULT_NATMAP, DEFAULT_TARGET_HOST, MAPPING_SCHEMES, RDP_PORT, SETTINGS_FILE, normalize_target_host, port, run_locked_mapping, save_access_address, target_endpoint
+from pages_projects import CloudflareError, LOGIN_COMMAND, PAGES_HOST, PROJECT_NAME, WEB_ACCESS_MODES, PagesNameUnavailable, PagesProjects, WranglerLogin, cloudflare_request, discover_cloudflare_connections, normalize_proxy_origin, project_token
 from platform_settings import AUTH_LABELS, PlatformProfile, PlatformSettings, pages_config, wrangler_login_status, write_json
 
 
-ADMIN_PORT = 8765
 ADMIN_URL = f"http://127.0.0.1:{ADMIN_PORT}/"
 REMOTE_LOOKUP_RETRY_SECONDS = 60
 PROJECT_SORT_MODES = ("custom", "name-asc", "name-desc")
+REMOTE_MANAGER_USER = "natmap"
 
 
 class ProjectInputError(ValueError):
@@ -53,6 +56,21 @@ def project_settings(values):
     }
 
 
+def remote_manager_password_hash(password):
+    if len(password) < 12:
+        raise ProjectInputError("manager_password", "请填写至少 12 个字符的远程管理密码。")
+    return generate_password_hash(password)
+
+
+def remote_manager_tls(project):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        context.load_cert_chain(project.manager_certificate, project.manager_private_key, password=lambda: "")
+    except (OSError, ValueError) as error:
+        raise ProjectInputError("manager_certificate", "无法加载远程管理的 PEM 证书或私钥，请检查文件路径和证书配置。") from error
+    return context
+
+
 @dataclass(frozen=True)
 class Project:
     slug: str
@@ -64,6 +82,12 @@ class Project:
     owner: str = ""
     target_host: str = DEFAULT_TARGET_HOST
     rdp_lookup_ready: bool = False
+    web_mode: str = "redirect"
+    proxy_origin: str = ""
+    manager_target: bool = False
+    manager_certificate: str = ""
+    manager_private_key: str = ""
+    manager_password_hash: str = field(default="", repr=False)
 
     def __post_init__(self):
         if not PROJECT_NAME.fullmatch(self.slug):
@@ -77,7 +101,7 @@ class Project:
         project_port(self.target_port, "target_port")
         if self.bind_port is not None:
             project_port(self.bind_port, "bind_port")
-        if self.target_is_loopback and self.target_port == ADMIN_PORT:
+        if self.target_is_loopback and self.target_port == ADMIN_PORT and not self.manager_target:
             raise ProjectInputError("target_port", f"端口 {ADMIN_PORT} 正由本机管理页使用。")
         if self.bind_port == ADMIN_PORT:
             raise ProjectInputError("bind_port", f"端口 {ADMIN_PORT} 正由本机管理页使用。")
@@ -85,6 +109,26 @@ class Project:
             raise ProjectInputError("bind_port", "NATMap 本地端口必须与本机服务端口不同。")
         if self.scheme not in MAPPING_SCHEMES:
             raise ProjectInputError("scheme", "请选择自动检测、HTTP、HTTPS 或 TCP。")
+        if self.web_mode not in WEB_ACCESS_MODES:
+            raise ProjectInputError("web_mode", "请选择 302 跳转直连或反向代理。")
+        try:
+            object.__setattr__(self, "proxy_origin", normalize_proxy_origin(self.proxy_origin))
+        except ValueError as error:
+            raise ProjectInputError("proxy_origin", str(error)) from error
+        if self.scheme == "https" and self.web_mode == "proxy" and not self.proxy_origin:
+            raise ProjectInputError("proxy_origin", "代理 HTTPS 服务需要填写与证书匹配的回源域名。")
+        if self.manager_target:
+            if (self.target_host != DEFAULT_TARGET_HOST or self.target_port != ADMIN_PORT
+                or self.scheme != "https"):
+                raise ProjectInputError("form", "NATMap 管理页使用专用 HTTPS 转发。")
+            if not self.proxy_origin:
+                raise ProjectInputError("proxy_origin", "请填写与证书匹配的 HTTPS 回源域名。")
+            if self.proxy_origin == f"{self.slug}.pages.dev":
+                raise ProjectInputError("proxy_origin", "回源域名需要指向 NATMap 公网 IPv4，请填写独立的域名。")
+            if not self.manager_password_hash:
+                raise ProjectInputError("manager_password", "请设置远程管理密码。")
+            if not self.manager_certificate or not self.manager_private_key:
+                raise ProjectInputError("manager_certificate", "请填写远程管理的 PEM 证书和私钥路径。")
         if self.entry:
             host = urlsplit(self.entry).netloc
             if not PAGES_HOST.fullmatch(host) or self.entry != f"https://{host}":
@@ -166,6 +210,7 @@ class Manager:
                 self.projects[project.slug] = project
         self.tasks = {}
         self.remote_lookups = {}
+        self.web_access_updates = set()
         self.lock = RLock()
         self.provision_lock = Lock()
         self.wrangler_login = WranglerLogin(self.configure_cloudflare)
@@ -262,7 +307,9 @@ class Manager:
                 if project.remote_link:
                     return project.remote_link
                 platform = self.platforms.selected()
-            PagesProjects(platform).deploy_remote_lookup(project.slug, project.entry, project.owner)
+            PagesProjects(platform).deploy_remote_lookup(
+                project.slug, project.entry, project.owner, web_mode=project.web_mode, proxy_origin=project.proxy_origin,
+            )
             with self.lock:
                 current = self.project(slug)
                 if not current.supports_remote_lookup or (current.entry, current.owner) != (project.entry, project.owner):
@@ -270,6 +317,33 @@ class Manager:
                 updated = replace(current, rdp_lookup_ready=True)
                 self.store(updated)
                 return updated.remote_link
+
+    def set_web_access(self, slug, web_mode, proxy_origin):
+        with self.provision_lock:
+            with self.lock:
+                project = self.project(slug)
+                task = self.tasks.get(slug)
+                detected = task.detected_scheme if task and self.active(slug) else ""
+                if not project.entry or project.scheme == "tcp" or detected == "tcp":
+                    raise ValueError("固定入口方式适用于 HTTP 或 HTTPS 网页项目。")
+                if project.manager_target or web_mode == "redirect":
+                    proxy_origin = project.proxy_origin
+                updated = replace(project, web_mode=web_mode, proxy_origin=proxy_origin)
+                if updated.web_mode == "proxy" and detected == "https" and not updated.proxy_origin:
+                    raise ProjectInputError("proxy_origin", "代理 HTTPS 服务需要填写与证书匹配的回源域名。")
+                if self.closing.is_set():
+                    raise ValueError("管理页正在退出。")
+                platform = self.platforms.selected()
+                self.web_access_updates.add(slug)
+            try:
+                PagesProjects(platform).set_web_access(
+                    slug, project.entry, project.owner, updated.web_mode, updated.proxy_origin, https_only=project.manager_target,
+                )
+                with self.lock:
+                    self.store(replace(self.project(slug), web_mode=updated.web_mode, proxy_origin=updated.proxy_origin))
+            finally:
+                with self.lock:
+                    self.web_access_updates.discard(slug)
 
     def store(self, project):
         self.save_projects({**self.projects, project.slug: project}, self.removed_owners)
@@ -347,6 +421,8 @@ class Manager:
     def remove(self, slug):
         with self.lock:
             project = self.project(slug)
+            if slug in self.web_access_updates:
+                raise ValueError("这个项目正在更新固定入口，请稍候。")
             if self.active(slug):
                 raise ValueError("请等创建结束或停止运行后再删除配置。")
             records = self.projects.copy()
@@ -358,13 +434,25 @@ class Manager:
             self.tasks.pop(slug, None)
             self.remote_lookups.pop(slug, None)
 
-    def edit(self, slug, name, target_port, bind_port, scheme, target_host=None):
+    def edit(self, slug, name, target_port, bind_port, scheme, target_host=None,
+             *, manager_password="", manager_certificate="", manager_private_key=""):
         with self.lock:
             project = self.project(slug)
+            if slug in self.web_access_updates:
+                raise ValueError("这个项目正在更新固定入口，请稍候。")
             if not project.ready:
                 raise ValueError("请在新建项目表单中修改未完成的项目。")
-            updated = replace(project, name=name, target_port=target_port, bind_port=bind_port, scheme=scheme,
-                              target_host=project.target_host if target_host is None else target_host)
+            if project.manager_target:
+                updated = replace(
+                    project, name=name, bind_port=bind_port,
+                    manager_password_hash=(remote_manager_password_hash(manager_password) if manager_password else project.manager_password_hash),
+                    manager_certificate=manager_certificate or project.manager_certificate,
+                    manager_private_key=manager_private_key or project.manager_private_key,
+                )
+                remote_manager_tls(updated)
+            else:
+                updated = replace(project, name=name, target_port=target_port, bind_port=bind_port, scheme=scheme,
+                                  target_host=project.target_host if target_host is None else target_host)
             if not updated.ready:
                 raise ValueError("网页协议需要 Pages 入口。请新建一个网页项目。")
             task = self.tasks.get(slug)
@@ -435,22 +523,23 @@ class Manager:
 
     def start_saved_projects(self):
         with self.lock:
-            projects = [project for project in self.projects.values() if project.ready]
-        for project in projects:
-            try:
-                with self.lock:
-                    if self.closing.is_set():
-                        break
-                    if project.slug not in self.projects or self.active(project.slug):
-                        continue
+            started = failed = 0
+            for project in self.projects.values():
+                if self.closing.is_set():
+                    break
+                if not project.ready or self.active(project.slug):
+                    continue
+                try:
                     self.begin(project.slug, "mapping")
-            except (OSError, ValueError, RuntimeError) as error:
-                message = str(error) or "无法启动打洞任务。"
-                task = Task("启动失败", project, detail=message)
-                task.logs.append(message)
-                with self.lock:
-                    if project.slug in self.projects and not self.active(project.slug):
-                        self.tasks[project.slug] = task
+                except (OSError, ValueError, RuntimeError) as error:
+                    message = str(error) or "无法启动打洞任务。"
+                    task = Task("启动失败", project, detail=message)
+                    task.logs.append(message)
+                    self.tasks[project.slug] = task
+                    failed += 1
+                else:
+                    started += 1
+            return started, failed
 
     def work(self, action, task):
         project = task.project
@@ -473,11 +562,14 @@ class Manager:
 
         try:
             if action == "provision":
-                report("正在创建 Pages 项目并部署跳转函数。")
+                report("正在创建 Pages 项目并部署固定入口。")
                 with self.provision_lock:
                     if task.stop.is_set():
                         return
-                    entry = PagesProjects(task.platform).provision(project.slug, project.owner, self.publish_token(project))
+                    entry = PagesProjects(task.platform).provision(
+                        project.slug, project.owner, self.publish_token(project),
+                        web_mode=project.web_mode, proxy_origin=project.proxy_origin, https_only=project.manager_target,
+                    )
                 with self.lock:
                     self.store(replace(project, entry=entry))
                     task.phase = "已创建"
@@ -497,26 +589,51 @@ class Manager:
                 with self.lock:
                     task.platform = None
 
+    @contextmanager
+    def mapping_target(self, project, bind_port):
+        if not project.manager_target:
+            yield project.target_host, project.target_port
+            return
+        tls = remote_manager_tls(project)
+        application = create_app(self, remote_project=project)
+        server = make_server(DEFAULT_TARGET_HOST, 0, application, threaded=True, ssl_context=tls)
+        if server.server_port == bind_port:
+            reserved = server
+            try:
+                server = make_server(DEFAULT_TARGET_HOST, 0, application, threaded=True, ssl_context=tls)
+            finally:
+                reserved.server_close()
+        thread = Thread(target=server.serve_forever, name=f"natmap-management-{project.slug}", daemon=True)
+        try:
+            thread.start()
+            yield DEFAULT_TARGET_HOST, server.server_port
+        finally:
+            if thread.is_alive():
+                server.shutdown()
+                thread.join()
+            server.server_close()
+
     def run_project_mapping(self, task, report, save_address, save_scheme):
         while True:
             project = task.project
             result = 0
             if not task.stop.is_set():
-                args = Namespace(target_host=project.target_host, target_port=project.target_port,
-                                 bind_port=task.bind_port, scheme=project.scheme, system_proxy=False)
                 redirect = (project.entry, self.publish_token(project)) if project.entry else None
 
                 def publish_via_d1(location):
                     pages = PagesProjects(self.platforms.selected())
                     pages.publish_mapping(project.slug, project.entry, project.owner, location)
 
-                result = run_locked_mapping(
-                    args, str(DEFAULT_NATMAP), redirect,
-                    project="" if project.slug == self.default_slug else project.slug,
-                    stop=task.stop, report=report, save_address=save_address, on_scheme=save_scheme,
-                    rdp_lookup_enabled=(lambda: self.prepare_remote_lookup(project)) if project.supports_remote_lookup else None,
-                    publish_via_d1=publish_via_d1 if project.entry and project.owner else None,
-                )
+                with self.mapping_target(project, task.bind_port) as (target_host, target_port):
+                    args = Namespace(target_host=target_host, target_port=target_port,
+                                     bind_port=task.bind_port, scheme=project.scheme, system_proxy=False)
+                    result = run_locked_mapping(
+                        args, str(DEFAULT_NATMAP), redirect,
+                        project="" if project.slug == self.default_slug else project.slug,
+                        stop=task.stop, report=report, save_address=save_address, on_scheme=save_scheme,
+                        rdp_lookup_enabled=(lambda: self.prepare_remote_lookup(project)) if project.supports_remote_lookup else None,
+                        publish_via_d1=publish_via_d1 if project.entry and project.owner else None,
+                    )
             with self.lock:
                 if task.phase != "正在重启" or self.closing.is_set():
                     task.phase = "启动失败" if result else "已停止"
@@ -536,10 +653,20 @@ class Manager:
 
     def stop(self, slug):
         with self.lock:
-            if not self.active(slug) or self.tasks[slug].phase not in ("运行中", "正在重启"):
+            if not self._request_mapping_stop(slug):
                 raise ValueError("这个项目没有可停止的打洞任务。")
-            self.tasks[slug].phase = "正在停止"
-            self.tasks[slug].stop.set()
+
+    def _request_mapping_stop(self, slug):
+        task = self.tasks.get(slug)
+        if not task or task.phase not in ("运行中", "正在重启") or not self.active(slug):
+            return False
+        task.phase = "正在停止"
+        task.stop.set()
+        return True
+
+    def stop_running_projects(self):
+        with self.lock:
+            return sum(self._request_mapping_stop(slug) for slug in self.tasks)
 
     def snapshot(self):
         with self.lock:
@@ -584,6 +711,8 @@ class Manager:
                              "target_host": project.target_host, "display_target_port": running.target_port,
                              "display_target_endpoint": endpoint, "changes_pending": changes_pending,
                              "bind_port": project.bind_port, "local_port": local_port, "scheme": project.scheme,
+                             "web_mode": project.web_mode, "proxy_origin": project.proxy_origin,
+                             "manager_target": project.manager_target,
                              "scheme_label": scheme_label, "rdp": effective_scheme == "tcp" and running.target_port == RDP_PORT,
                              "show_entry": bool(fixed_link), "fixed_link": fixed_link, "remote_link": project.remote_link,
                              "supports_remote_lookup": remote_mode, "remote_lookup_status": lookup_status,
@@ -606,13 +735,21 @@ class Manager:
                 task.thread.join()
 
 
-def create_app(manager):
+def create_app(manager, *, remote_project=None):
     app = Flask(__name__)
-    app.config.update(SECRET_KEY=token_urlsafe(32), TRUSTED_HOSTS=["127.0.0.1", "localhost"],
+    trusted_hosts = [remote_project.proxy_origin] if remote_project else ["127.0.0.1", "localhost"]
+    app.config.update(SECRET_KEY=token_urlsafe(32), TRUSTED_HOSTS=trusted_hosts,
                       SESSION_COOKIE_SAMESITE="Strict", MAX_CONTENT_LENGTH=8192)
+    if remote_project:
+        app.config.update(SESSION_COOKIE_NAME="natmap_remote_session", SESSION_COOKIE_SECURE=True)
 
     @app.before_request
     def verify_form():
+        if remote_project:
+            auth = request.authorization
+            if (not auth or auth.type != "basic" or auth.username != REMOTE_MANAGER_USER
+                or not check_password_hash(remote_project.manager_password_hash, auth.password or "")):
+                return "", 401, {"WWW-Authenticate": 'Basic realm="NATMap", charset="UTF-8"'}
         if request.method == "POST":
             presented = request.form.get("csrf", "")
             expected = session.get("csrf")
@@ -745,15 +882,44 @@ def create_app(manager):
     def create_project():
         wants_json = request.accept_mimetypes.best == "application/json"
         values = {key: request.form.get(key, "") for key in ("name", "slug", "target_port", "bind_port")}
+        values["target_kind"] = request.form.get("target_kind", "service")
+        values["manager_origin"] = request.form.get("manager_origin", "")
+        values["manager_certificate"] = request.form.get("manager_certificate", "").strip()
+        values["manager_private_key"] = request.form.get("manager_private_key", "").strip()
         values["target_host"] = request.form.get("target_host", DEFAULT_TARGET_HOST)
         values["scheme"] = request.form.get("scheme", "auto")
+        values["web_mode"] = request.form.get("web_mode", "redirect") if values["scheme"] != "tcp" else "redirect"
+        values["proxy_origin"] = request.form.get("proxy_origin", "") if values["web_mode"] == "proxy" else ""
         previous = request.form.get("draft", "")
         try:
+            if values["target_kind"] not in ("service", "manager"):
+                raise ProjectInputError("target_kind", "请选择要转发的服务。")
+            manager_options = {}
+            if values["target_kind"] == "manager":
+                values.update(target_host=DEFAULT_TARGET_HOST, target_port=str(ADMIN_PORT), scheme="https",
+                              web_mode=request.form.get("manager_web_mode", "proxy"), proxy_origin=values["manager_origin"])
+                for key in ("manager_certificate", "manager_private_key"):
+                    if not values[key]:
+                        raise ProjectInputError(key, "请填写 PEM 证书路径。" if key == "manager_certificate" else "请填写 PEM 私钥路径。")
+                manager_options = {
+                    "manager_target": True,
+                    "manager_certificate": values["manager_certificate"],
+                    "manager_private_key": values["manager_private_key"],
+                    "manager_password_hash": remote_manager_password_hash(request.form.get("manager_password", "")),
+                }
             slug = f"tcp-{token_hex(8)}" if values["scheme"] == "tcp" else values["slug"].strip().lower()
-            project = Project(slug, **project_settings(values))
+            project = Project(slug, **project_settings(values), web_mode=values["web_mode"],
+                              proxy_origin=values["proxy_origin"], **manager_options)
+            if project.manager_target:
+                remote_manager_tls(project)
             manager.create(project, previous)
         except ValueError as error:
-            issue = {"field": getattr(error, "field", "form"), "message": str(error)}
+            field = getattr(error, "field", "form")
+            if field == "proxy_origin" and values["target_kind"] == "manager":
+                field = "manager_origin"
+            if field == "web_mode" and values["target_kind"] == "manager":
+                field = "manager_web_mode"
+            issue = {"field": field, "message": str(error)}
             if wants_json:
                 return jsonify(issue), 422
             return render_dashboard(open_create=True, draft_slug=previous, values=values, issue=issue), 422
@@ -774,7 +940,11 @@ def create_app(manager):
         values["target_host"] = request.form.get("target_host")
         values["scheme"] = request.form.get("scheme", "http")
         try:
-            restarting = manager.edit(slug, **project_settings(values))
+            restarting = manager.edit(
+                slug, **project_settings(values), manager_password=request.form.get("manager_password", ""),
+                manager_certificate=request.form.get("manager_certificate", "").strip(),
+                manager_private_key=request.form.get("manager_private_key", "").strip(),
+            )
         except ValueError as error:
             if wants_json:
                 return jsonify(message=str(error)), 422
@@ -804,6 +974,19 @@ def create_app(manager):
             return jsonify(message="无法保存排序，请检查本机项目配置。"), 500
         return jsonify(mode=mode)
 
+    @app.post("/project/web-access")
+    def set_web_access():
+        slug = request.form.get("slug", "").strip().lower()
+        web_mode = request.form.get("web_mode", "")
+        try:
+            manager.set_web_access(slug, web_mode, request.form.get("proxy_origin", ""))
+        except (CloudflareError, ValueError) as error:
+            return jsonify(message=str(error)), 422
+        except OSError:
+            return jsonify(message="无法保存本机入口设置，请重试。"), 500
+        label = "反向代理" if web_mode == "proxy" else "302 跳转直连"
+        return jsonify(message=f"固定入口已切换为{label}。")
+
     @app.post("/project/<action>")
     def change(action):
         slug = request.form.get("slug", "").strip().lower()
@@ -812,6 +995,15 @@ def create_app(manager):
                 manager.begin(slug, action)
             elif action == "stop":
                 manager.stop(slug)
+            elif action == "start-all":
+                started, failed = manager.start_saved_projects()
+                message = f"已发起 {started} 个项目的启动。"
+                if failed:
+                    message += f"{failed} 个项目启动失败，请查看运行日志。"
+                flash(message, "error" if failed else "message")
+            elif action == "stop-all":
+                stopped = manager.stop_running_projects()
+                flash(f"已向 {stopped} 个运行中的项目发送停止请求。")
             elif action == "delete":
                 manager.remove(slug)
                 flash("本机配置已删除。")

@@ -102,7 +102,9 @@ function renderConnection(row, panel, text) {
   const lines = text.split("\n").filter(Boolean);
 
   if (direct) {
-    const address = lines.find(line => /^直连地址\s+\S+$/.test(line))?.replace(/^直连地址\s+/, "") || "";
+    const mapped = lines.find(line => /^直连地址\s+\S+$/.test(line))?.replace(/^直连地址\s+/, "") || "";
+    const manager = row.hasAttribute("data-manager-target");
+    const address = manager ? mapped.replace(/^https:\/\//, "") : mapped;
     direct.hidden = !address;
     row.querySelector("[data-direct-empty]").hidden = Boolean(address);
     const link = direct.querySelector("[data-direct-link]");
@@ -117,7 +119,8 @@ function renderConnection(row, panel, text) {
       endpoint.textContent = address;
       link.replaceChildren("mstsc /v:", endpoint);
     } else link.textContent = address;
-    setCopyAddress(direct.querySelector("[data-copy-address]"), command || address, command ? "远程桌面命令" : "直连地址");
+    setCopyAddress(direct.querySelector("[data-copy-address]"), command || address,
+      command ? "远程桌面命令" : manager ? "公网映射地址" : "直连地址");
     const commandPanel = panel.querySelector("[data-rdp-command]");
     if (commandPanel) {
       commandPanel.hidden = !command;
@@ -276,6 +279,8 @@ async function saveProjectEditor(event) {
     name.textContent = result.name;
     name.title = result.name;
     project.panel.querySelector("[data-editor-project]").textContent = result.name;
+    const managerPassword = form.elements.namedItem("manager_password");
+    if (managerPassword) managerPassword.value = "";
     displayProjectOrder();
     showProjectNotice(result.message);
   } catch {
@@ -292,6 +297,37 @@ function showProjectNotice(message) {
   notice.hidden = false;
   window.clearTimeout(editNoticeTimer);
   editNoticeTimer = window.setTimeout(() => { notice.hidden = true; }, 5000);
+}
+
+function syncProxyOrigin(form) {
+  const field = form.querySelector("[data-proxy-origin]");
+  if (field) field.hidden = form.elements.namedItem("web_mode").value !== "proxy";
+}
+
+async function saveWebAccess(event) {
+  const form = event.target;
+  if (!form.matches("[data-web-access-form]")) return;
+  event.preventDefault();
+  const fields = form.querySelector("fieldset");
+  if (fields.disabled) return;
+  const body = new FormData(form);
+  const button = form.querySelector('button[type="submit"]');
+  const error = form.querySelector("[data-web-access-error]");
+  fields.disabled = true;
+  button.textContent = "正在更新 Pages…";
+  error.hidden = true;
+  try {
+    const response = await fetch(form.action, { method: "POST", body });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.message);
+    showProjectNotice(result.message);
+  } catch (failure) {
+    error.textContent = failure.message || "固定入口更新失败，请重试。";
+    error.hidden = false;
+  } finally {
+    fields.disabled = false;
+    button.textContent = "应用入口方式";
+  }
 }
 
 function displayProjectOrder() {
@@ -440,6 +476,10 @@ if (projectEditor) {
     if (event.target.closest("[data-close-editor]")) closeProjectEditor();
   });
   projectEditor.addEventListener("submit", saveProjectEditor);
+  projectEditor.addEventListener("submit", saveWebAccess);
+  projectEditor.addEventListener("change", event => {
+    if (event.target.name === "web_mode") syncProxyOrigin(event.target.form);
+  });
   document.addEventListener("keydown", event => {
     if (event.key === "Escape" && editorToggle && !createDialog?.open) {
       event.preventDefault();
@@ -492,17 +532,36 @@ function setDraftSlug(slug) {
 function syncCreateProtocol() {
   const entry = createForm.querySelector("[data-create-entry]");
   if (!entry) return;
-  const tcp = createForm.elements.namedItem("scheme").value === "tcp";
+  const manager = createForm.elements.namedItem("target_kind")?.value === "manager";
+  const tcp = !manager && createForm.elements.namedItem("scheme").value === "tcp";
   const slug = createForm.elements.namedItem("slug");
   entry.hidden = tcp;
   slug.required = !tcp;
   slug.disabled = tcp;
+  const managerFields = createForm.querySelector("[data-manager-settings]");
+  if (managerFields) {
+    managerFields.hidden = !manager;
+    managerFields.disabled = !manager;
+    const serviceFields = createForm.querySelector("[data-service-settings]");
+    serviceFields.hidden = manager;
+    serviceFields.disabled = manager;
+    createForm.querySelector("[data-create-target-port]").hidden = manager;
+    createForm.elements.namedItem("target_port").disabled = manager;
+  }
+  const webAccess = createForm.querySelector("[data-create-web-access]");
+  if (webAccess) {
+    webAccess.hidden = tcp || manager;
+    webAccess.disabled = tcp || manager;
+    syncProxyOrigin(createForm);
+  }
   createForm.elements.namedItem("target_port").placeholder = tcp ? "3389" : "5000";
 }
 
 if (createDialog) {
   syncCreateProtocol();
   createForm.elements.namedItem("scheme").addEventListener("change", syncCreateProtocol);
+  createForm.elements.namedItem("target_kind")?.addEventListener("change", syncCreateProtocol);
+  createForm.elements.namedItem("web_mode")?.addEventListener("change", () => syncProxyOrigin(createForm));
   const open = document.querySelector("[data-open-create]");
   open.addEventListener("click", event => {
     if (event.button || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
@@ -563,6 +622,8 @@ async function refreshProjectList(slug) {
   editorPanel.append(panel);
   list.hidden = false;
   document.querySelector("[data-empty-projects]").hidden = true;
+  const batchActions = dashboard.querySelector("[data-batch-actions]");
+  if (batchActions) batchActions.hidden = false;
   bindProjectRow(row);
   displayProjectOrder();
   updateProjectOrderControls();
@@ -582,6 +643,19 @@ async function updateCreateForm(projects) {
     setDraftSlug("");
     for (const name of ["name", "slug", "target_port", "bind_port"]) createForm.elements.namedItem(name).value = "";
     createForm.elements.namedItem("scheme").value = "auto";
+    const targetKind = createForm.elements.namedItem("target_kind");
+    if (targetKind) {
+      targetKind.value = "service";
+      createForm.elements.namedItem("manager_web_mode").value = "proxy";
+      for (const name of ["manager_origin", "manager_certificate", "manager_private_key", "manager_password"]) {
+        createForm.elements.namedItem(name).value = "";
+      }
+    }
+    const webMode = createForm.elements.namedItem("web_mode");
+    if (webMode) {
+      webMode.value = "redirect";
+      createForm.elements.namedItem("proxy_origin").value = "";
+    }
     syncCreateProtocol();
     const host = createForm.elements.namedItem("target_host");
     if (host) host.value = "127.0.0.1";
@@ -623,6 +697,8 @@ async function updateStatus() {
       const scheme = row.querySelector("[data-scheme]");
       if (scheme) scheme.title = scheme.textContent = project.scheme_label ?? project.scheme.toUpperCase();
       row.toggleAttribute("data-rdp", Boolean(project.rdp));
+      const webAccess = panel.querySelector("[data-web-access]");
+      if (webAccess) webAccess.hidden = project.scheme === "tcp" || project.rdp;
       const remoteLink = project.remote_link ? new URL("/", project.remote_link).href : "";
       const fixedLink = remoteLink && project.fixed_link === project.remote_link ? remoteLink : project.fixed_link;
       const fixed = row.querySelector("[data-fixed-entry]");

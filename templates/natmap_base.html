@@ -6,6 +6,10 @@
     {% endif %}
   {% endfor %}
 {%- endmacro %}
+{%- macro web_mode_options(selected) -%}
+  <option value="redirect"{% if selected != 'proxy' %} selected{% endif %}>302 跳转直连</option>
+  <option value="proxy"{% if selected == 'proxy' %} selected{% endif %}>反向代理</option>
+{%- endmacro %}
 {%- macro target_host_input(value, attributes='') -%}
   <input name="target_host" value="{{ value }}" list="target-host-presets" spellcheck="false" autocomplete="off"
          placeholder="如 192.168.1.20" {{ attributes }} required>

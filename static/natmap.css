@@ -106,10 +106,10 @@ input:focus, select:focus { outline: 2px solid #229781; outline-offset: 1px; }
 .project-order { display: flex; gap: 6px; margin-top: 3px; }
 .project-order button { min-width: 32px; min-height: 26px; padding: 0 6px; line-height: 1.15; }
 .project-table-container { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
-.project-table { width: 100%; min-width: 1280px; table-layout: fixed; border-collapse: collapse; text-align: left; font-size: .875rem; }
+.project-table { width: 100%; min-width: 1376px; table-layout: fixed; border-collapse: collapse; text-align: left; font-size: .875rem; }
 .project-name-column { width: 6.5rem; }
 .project-status-column { width: 5.875rem; }
-.project-ports-column { width: 7.75rem; }
+.project-ports-column { width: 13rem; }
 .project-protocol-column { width: 6.375rem; }
 .project-actions-column { width: 9.25rem; }
 .project-table th, .project-table td { padding: 12px; vertical-align: middle; }
@@ -141,12 +141,12 @@ input:focus, select:focus { outline: 2px solid #229781; outline-offset: 1px; }
   font: .667rem/1.2 Consolas, monospace;
 }
 .project-protocol { font-size: .8125rem; }
-.project-ports { white-space: nowrap; }
-.project-ports div { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.project-table .project-ports { padding-block: 4px; white-space: nowrap; }
+.project-ports div { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; line-height: 1.2; }
 .project-ports div + div { margin-top: 4px; }
-.project-ports span { color: var(--muted); font-size: .75rem; }
+.project-ports span { flex: none; color: var(--muted); font-size: .75rem; }
 .project-ports strong { font-variant-numeric: tabular-nums; font-weight: 600; }
-.project-ports [data-target-port] { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.project-ports [data-target-port] { min-width: 0; white-space: normal; word-break: break-all; text-align: right; font: 600 .75rem/1.15 Consolas, monospace; }
 .project-actions { display: grid; grid-template-columns: 4.125rem 3.5rem; justify-content: start; gap: 6px; }
 .project-actions :is([data-run], [data-stop]) { grid-area: 1 / 1; }
 .project-actions [data-manage-toggle] { grid-area: 1 / 2; }

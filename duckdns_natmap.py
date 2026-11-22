@@ -26,6 +26,7 @@ from pages_projects import CloudflareError, PROJECT_NAME, project_token
 
 DEFAULT_NATMAP = Path(__file__).with_name("natmap-win-x64.exe")
 DEFAULT_TARGET_HOST = "127.0.0.1"
+ADMIN_PORT = 8765
 MAPPING_SCHEMES = ("auto", "http", "https", "tcp")
 RDP_PORT = 3389
 # X.224 Connection Request with an RDP Negotiation Request for TLS and CredSSP.
@@ -459,6 +460,8 @@ def main():
             project_data = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
             projects = project_data.get("projects", []) if isinstance(project_data, dict) else project_data
             project = next(item for item in projects if item.get("slug") == args.project)
+            if project.get("manager_target"):
+                parser.error("NATMap 管理页项目需要从管理界面启动其 HTTPS 入口。")
             if not project.get("entry") and project.get("scheme") != "tcp":
                 raise ValueError
         except (OSError, ValueError, TypeError, AttributeError, StopIteration):
@@ -489,6 +492,8 @@ def main():
         args.target_host = normalize_target_host(host)
     except ValueError as error:
         parser.error(str(error))
+    if ip_address(args.target_host).is_loopback and args.target_port == ADMIN_PORT:
+        parser.error("请在管理界面选择「NATMap 管理页（8765）」来创建受保护的远程入口。")
 
     redirect = None
     if args.publish and getattr(args, "scheme", None) != "tcp":

@@ -7,6 +7,7 @@
 <dialog class="panel create-dialog" aria-labelledby="new-heading" data-create-dialog{% if open_create %} data-open{% endif %}>
     <h2 id="new-heading">新建项目</h2>
     {% set pending = draft and draft.busy %}
+    {% set manager_target = values.target_kind == 'manager' or values.manager_target %}
     <form method="post" action="{{ url_for('create_project') }}" data-create-form data-draft="{{ draft.slug if draft else '' }}"
           data-dashboard-url="{{ url_for('index') }}"{% if pending %} data-pending{% endif %}>
       <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -16,17 +17,48 @@
           <input name="name" maxlength="60" placeholder="如「项目面板」" value="{{ values.name | default('') }}" {{ issue_attributes('name') }} required autofocus>
           {{ create_issue('name') }}
         </label>
-        <label data-create-entry{% if values.scheme == 'tcp' %} hidden{% endif %}>独立子域名
-          <span class="suffix"><input name="slug" pattern="[a-z0-9]([a-z0-9\x2D]{0,38}[a-z0-9])?" maxlength="40" placeholder="workbench" value="{{ values.slug | default('') }}" {{ issue_attributes('slug') }}{% if values.scheme == 'tcp' %} disabled{% else %} required{% endif %}><span>.pages.dev</span></span>
+        <label>转发目标
+          <select name="target_kind" {{ issue_attributes('target_kind') }}>
+            <option value="service"{% if not manager_target %} selected{% endif %}>本机或局域网服务</option>
+            <option value="manager"{% if manager_target %} selected{% endif %}>NATMap 管理页（8765）</option>
+          </select>
+          {{ create_issue('target_kind') }}
+        </label>
+        <label data-create-entry{% if values.scheme == 'tcp' and not manager_target %} hidden{% endif %}>独立子域名
+          <span class="suffix"><input name="slug" pattern="[a-z0-9]([a-z0-9\x2D]{0,38}[a-z0-9])?" maxlength="40" placeholder="workbench" value="{{ values.slug | default('') }}" {{ issue_attributes('slug') }}{% if values.scheme == 'tcp' and not manager_target %} disabled{% else %} required{% endif %}><span>.pages.dev</span></span>
           {{ create_issue('slug') }}
         </label>
-        <label>服务端口
-          <input type="number" name="target_port" min="1" max="65535" placeholder="{{ '3389' if values.scheme == 'tcp' else '5000' }}" value="{{ values.target_port | default('') }}" {{ issue_attributes('target_port') }} required>
+        <label data-create-target-port{% if manager_target %} hidden{% endif %}>服务端口
+          <input type="number" name="target_port" min="1" max="65535" placeholder="{{ '3389' if values.scheme == 'tcp' else '5000' }}" value="{{ values.target_port | default('') }}" {{ issue_attributes('target_port') }} required{% if manager_target %} disabled{% endif %}>
           {{ create_issue('target_port') }}
         </label>
-        <details class="advanced-settings"{% if (values.target_host and values.target_host != '127.0.0.1') or values.bind_port or values.scheme in ('http', 'https', 'tcp') or (issue and issue.field in ('target_host', 'bind_port', 'scheme')) %} open{% endif %}>
+        <fieldset class="create-fields" data-manager-settings{% if not manager_target %} hidden disabled{% endif %}>
+          <label>HTTPS 回源域名
+            <input name="manager_origin" value="{{ values.manager_origin | default(values.proxy_origin | default('')) }}" placeholder="origin.example.com" {{ issue_attributes('manager_origin') }} required>
+            {{ create_issue('manager_origin') }}
+          </label>
+          <label>证书路径（PEM）
+            <input name="manager_certificate" value="{{ values.manager_certificate | default('') }}" placeholder="C:\certs\fullchain.pem" {{ issue_attributes('manager_certificate') }} required>
+            {{ create_issue('manager_certificate') }}
+          </label>
+          <label>私钥路径（PEM）
+            <input name="manager_private_key" value="{{ values.manager_private_key | default('') }}" placeholder="C:\certs\privkey.pem" {{ issue_attributes('manager_private_key') }} required>
+            {{ create_issue('manager_private_key') }}
+          </label>
+          <label>远程管理密码
+            <input type="password" name="manager_password" autocomplete="new-password" minlength="12" {{ issue_attributes('manager_password') }} required>
+            {{ create_issue('manager_password') }}
+          </label>
+          <label>固定入口方式
+            <select name="manager_web_mode" {{ issue_attributes('manager_web_mode') }}>{{ web_mode_options(values.web_mode | default('proxy')) }}</select>
+            {{ create_issue('manager_web_mode') }}
+          </label>
+          <p class="hint">远程使用 HTTPS，登录用户名为 natmap。</p>
+        </fieldset>
+        <details class="advanced-settings"{% if (values.target_host and values.target_host != '127.0.0.1') or values.bind_port or values.scheme in ('http', 'https', 'tcp') or values.web_mode == 'proxy' or (issue and issue.field in ('target_host', 'bind_port', 'scheme', 'web_mode', 'proxy_origin')) %} open{% endif %}>
           <summary>高级设置</summary>
           <div class="advanced-fields">
+            <fieldset class="create-fields" data-service-settings{% if manager_target %} hidden disabled{% endif %}>
             <label>服务监听地址
               {{ target_host_input(values.target_host | default('127.0.0.1'), issue_attributes('target_host')) }}
               {{ create_issue('target_host') }}
@@ -35,6 +67,17 @@
               <select name="scheme" {{ issue_attributes('scheme') }}>{{ scheme_options(values.scheme) }}</select>
               {{ create_issue('scheme') }}
             </label>
+            <fieldset class="create-fields" data-create-web-access{% if values.scheme == 'tcp' %} hidden disabled{% endif %}>
+              <label>固定入口方式
+                <select name="web_mode" {{ issue_attributes('web_mode') }}>{{ web_mode_options(values.web_mode) }}</select>
+                {{ create_issue('web_mode') }}
+              </label>
+              <label data-proxy-origin{% if values.web_mode != 'proxy' %} hidden{% endif %}>HTTPS 回源域名（HTTP 可留空）
+                <input name="proxy_origin" value="{{ values.proxy_origin | default('') }}" placeholder="origin.example.com" maxlength="253" {{ issue_attributes('proxy_origin') }}>
+                {{ create_issue('proxy_origin') }}
+              </label>
+            </fieldset>
+            </fieldset>
             <label>NATMap 本地端口（选填）
               <input type="number" name="bind_port" min="1" max="65535" placeholder="留空自动分配" value="{{ values.bind_port | default('', true) }}" {{ issue_attributes('bind_port') }}>
               {{ create_issue('bind_port') }}
