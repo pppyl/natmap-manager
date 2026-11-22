@@ -33,6 +33,7 @@ ADMIN_URL = f"http://127.0.0.1:{ADMIN_PORT}/"
 REMOTE_LOOKUP_RETRY_SECONDS = 60
 PROJECT_SORT_MODES = ("custom", "name-asc", "name-desc")
 REMOTE_MANAGER_USER = "natmap"
+PROJECT_NOTE_LIMIT = 200
 
 
 class ProjectInputError(ValueError):
@@ -95,12 +96,15 @@ class Project:
     shared_entry: str = ""
     tcp_group_ready: bool = False
     tcp_group_version: int = 0
+    note: str = ""
 
     def __post_init__(self):
         if not PROJECT_NAME.fullmatch(self.slug):
             raise ProjectInputError("slug", "子域名长度为 1 到 40，使用小写英文字母、数字或连字符，首尾不能为连字符。")
         if not self.name.strip() or len(self.name) > 60:
             raise ProjectInputError("name", "请填写项目名称，最多 60 个字。")
+        if not isinstance(self.note, str) or len(self.note) > PROJECT_NOTE_LIMIT:
+            raise ProjectInputError("note", f"备注最多 {PROJECT_NOTE_LIMIT} 个字符。")
         try:
             object.__setattr__(self, "target_host", normalize_target_host(self.target_host))
         except ValueError as error:
@@ -327,7 +331,7 @@ class Manager:
             members = self.share_members(gateway.slug)
             if not members and not gateway.tcp_group_ready:
                 return None
-            devices = [{"id": row.slug, "name": row.name} for row in [gateway, *members]]
+            devices = [{"id": row.slug, "name": row.name, "note": row.note} for row in [gateway, *members]]
             return {"device": current.slug, "directory": {"revision": self.directory_revision, "devices": devices}}
 
     def prepare_remote_lookup(self, project, rdp):
@@ -416,6 +420,16 @@ class Manager:
 
     def store(self, project):
         self.save_projects({**self.projects, project.slug: project}, self.removed_owners)
+
+    def save_project_note(self, slug, note):
+        note = note.replace("\r\n", "\n").replace("\r", "\n").strip()
+        with self.lock:
+            if self.closing.is_set():
+                raise ValueError("管理页正在退出。")
+            project = self.project(slug)
+            if project.note != note:
+                self.store(replace(project, note=note))
+        return note
 
     def save_projects(self, records, removed_owners, *, sort_mode=None):
         sort_mode = self.sort_mode if sort_mode is None else sort_mode
@@ -827,7 +841,7 @@ class Manager:
                     elif lookup and lookup.error:
                         lookup_status = "等待重试"
                         lookup_error = lookup.error
-                rows.append({"slug": project.slug, "name": project.name, "target_port": project.target_port,
+                rows.append({"slug": project.slug, "name": project.name, "note": project.note, "target_port": project.target_port,
                              "target_host": project.target_host, "display_target_port": running.target_port,
                              "display_target_endpoint": endpoint, "changes_pending": changes_pending,
                              "bind_port": project.bind_port, "local_port": local_port, "scheme": project.scheme,
@@ -902,6 +916,7 @@ def create_app(manager, *, remote_project=None):
         )
         return render_template(
             "natmap.html", projects=projects, drafts=drafts,
+            note_limit=PROJECT_NOTE_LIMIT,
             shared_entries=[project for project in projects if project["can_share_entry"]],
             can_import=can_import, csrf=csrf_token(), edit_issue=edit_issue, sort_mode=manager.sort_mode,
             open_create=open_create, draft=draft, values=values or draft or {"scheme": "auto"}, issue=issue,
@@ -1089,6 +1104,25 @@ def create_app(manager, *, remote_project=None):
         if wants_json:
             return jsonify(name=values["name"].strip(), message=message)
         flash(message)
+        return redirect(url_for("index", _anchor=f"project-{slug}"), code=303)
+
+    @app.post("/project/note")
+    def save_project_note():
+        slug = request.form.get("slug", "").strip().lower()
+        wants_json = request.accept_mimetypes.best == "application/json"
+        status = 200
+        try:
+            note = manager.save_project_note(slug, request.form.get("note", ""))
+            message = "备注已保存。"
+        except ValueError as error:
+            status, message = 422, str(error)
+        except OSError:
+            status, message = 500, "无法保存备注，请检查本机文件。"
+        if wants_json:
+            if status != 200:
+                return jsonify(message=message), status
+            return jsonify(note=note, message=message)
+        flash(message, "message" if status == 200 else "error")
         return redirect(url_for("index", _anchor=f"project-{slug}"), code=303)
 
     @app.post("/project/sort")

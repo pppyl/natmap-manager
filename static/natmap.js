@@ -256,22 +256,29 @@ function closeProjectEditor() {
 
 async function saveProjectEditor(event) {
   const form = event.target;
-  if (!form.matches("[data-edit-form]")) return;
+  if (!form.matches("[data-edit-form], [data-note-form]")) return;
   const submit = form.querySelector('button[type="submit"]');
   event.preventDefault();
   if (submit.disabled) return;
   submit.disabled = true;
   const error = form.querySelector("[data-edit-error]");
   error.hidden = true;
+  const body = new FormData(form);
   try {
     const response = await fetch(form.action, {
-      method: "POST", headers: { Accept: "application/json" }, body: new FormData(form),
+      method: "POST", headers: { Accept: "application/json" }, body,
     });
     const result = await response.json();
     if (!response.ok) {
       error.textContent = result.message || "配置未保存，请重试。";
       error.hidden = false;
       error.scrollIntoView({ block: "nearest" });
+      return;
+    }
+    const note = form.elements.namedItem("note");
+    if (note) {
+      if (note.value === body.get("note")) note.value = result.note;
+      showProjectNotice(result.message);
       return;
     }
     const project = projectsBySlug.get(form.elements.namedItem("slug").value);
@@ -284,7 +291,7 @@ async function saveProjectEditor(event) {
     displayProjectOrder();
     showProjectNotice(result.message);
   } catch {
-    error.textContent = "无法保存配置，请重试。";
+    error.textContent = "保存失败，请重试。";
     error.hidden = false;
   } finally {
     submit.disabled = false;

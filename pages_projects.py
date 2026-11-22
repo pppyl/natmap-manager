@@ -31,7 +31,7 @@ PROJECT_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?\Z")
 PAGES_HOST = re.compile(r"[a-z0-9-]+\.pages\.dev\Z")
 WEB_ACCESS_MODES = ("redirect", "proxy")
 MAPPING_LEASE_SECONDS = 180  # Keep this aligned with LEASE_MS in the Pages function.
-REMOTE_LOOKUP_VERSION = 13  # Keep this aligned with X-NATMap-Remote-Version.
+REMOTE_LOOKUP_VERSION = 14  # Keep this aligned with X-NATMap-Remote-Version.
 
 
 def powershell_path(path):

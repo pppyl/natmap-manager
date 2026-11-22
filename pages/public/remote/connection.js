@@ -101,6 +101,9 @@ async function fetchDevices() {
 
 function showDevice(card, device) {
   card.querySelector("[data-device-name]").textContent = device.name;
+  const note = card.querySelector("[data-device-note]");
+  note.textContent = device.note || "";
+  note.hidden = !note.textContent;
   const state = card.querySelector("[data-device-state]");
   const label = { available: "已同步", pending: "待同步", expired: "地址已过期", invalid: "等待 TCP 地址" };
   state.dataset.state = device.address ? "available" : device.state || "pending";

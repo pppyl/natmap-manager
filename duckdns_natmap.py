@@ -543,7 +543,7 @@ def main():
         if members and not anchor.get("tcp_group_ready"):
             parser.error("共享入口尚未部署，请先在管理页运行任意组内项目。")
         if anchor.get("tcp_group_ready"):
-            devices = [{"id": row["slug"], "name": row["name"]} for row in [anchor, *members]]
+            devices = [{"id": row["slug"], "name": row["name"], "note": row.get("note", "")} for row in [anchor, *members]]
             tcp_group = {"device": project["slug"],
                          "directory": {"revision": project_data["directory_revision"], "devices": devices}}
     redirect = None

@@ -50,6 +50,16 @@
           <button type="submit" class="primary">保存配置</button>
         </form>
 
+        <form method="post" action="{{ url_for('save_project_note') }}" class="project-more create-fields" data-note-form>
+          <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="slug" value="{{ project.slug }}">
+          <label>项目备注
+            <textarea name="note" rows="2" maxlength="{{ note_limit }}" aria-describedby="note-hint-{{ project.slug }}">{{ project.note }}</textarea>
+          </label>
+          <p class="hint" id="note-hint-{{ project.slug }}">备注会显示在共享入口的实例名称下方，访客可见。</p>
+          <p class="form-error" data-edit-error role="alert" hidden></p>
+          <div><button type="submit" class="secondary">保存备注</button></div>
+        </form>
+
         {% if project.own_entry %}
           <section class="project-more" data-web-access{% if project.tcp %} hidden{% endif %}>
             <h3>网页固定入口</h3>

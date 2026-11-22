@@ -12,7 +12,7 @@ const REMOTE_HEADERS = {
   ...NO_CACHE,
   "Referrer-Policy": "no-referrer",
   "X-Robots-Tag": "noindex, nofollow",
-  "X-NATMap-Remote-Version": "13",
+  "X-NATMap-Remote-Version": "14",
 };
 const encoder = new TextEncoder();
 const WEB_PROXY_HEADERS = { "X-NATMap-Entry-Mode": "proxy" };
@@ -75,7 +75,8 @@ function tcpEndpoint(location) {
 function validDevices(devices, project) {
   return Array.isArray(devices) && devices[0]?.id === project &&
     devices.every(device => typeof device?.id === "string" && PROJECT_NAME.test(device.id)
-      && typeof device.name === "string" && device.name.trim() && [...device.name].length <= 60) &&
+      && typeof device.name === "string" && device.name.trim() && [...device.name].length <= 60
+      && (device.note === undefined || (typeof device.note === "string" && [...device.note].length <= 200))) &&
     new Set(devices.map(device => device.id)).size === devices.length;
 }
 
@@ -95,11 +96,11 @@ async function deviceList(env, project) {
   ).bind(project, `${project}/*`).all();
   const mappings = new Map(results.map(row => [row.project, row]));
   const now = Date.now();
-  return readDirectory(mappings.get(`${project}/`), project).map(({ id, name }) => {
+  return readDirectory(mappings.get(`${project}/`), project).map(({ id, name, note = "" }) => {
     const row = mappings.get(id === project ? project : `${project}/${id}`);
     const endpoint = tcpEndpoint(row?.location);
     const state = !row ? "pending" : !endpoint ? "invalid" : row.expires_at > now ? "available" : "expired";
-    return { id, name, address: state === "available" ? endpoint.address : "", rdp: endpoint?.rdp ?? false, state };
+    return { id, name, note, address: state === "available" ? endpoint.address : "", rdp: endpoint?.rdp ?? false, state };
   });
 }
 
