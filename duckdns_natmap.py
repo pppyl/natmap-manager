@@ -267,7 +267,7 @@ def read_natmap_output(stream, messages):
 
 def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None,
                      report=log_line, save_address=save_access_address, tcp_lookup_enabled=None,
-                     publish_via_d1=None, rdp=False, tcp_group=None):
+                     publish_via_d1=None, rdp=False, tcp_group=None, tcp_revision=None):
     """Run one NATMap attempt and report whether the local address could not be reused."""
     messages = Queue()
     stop = stop if stop is not None else Event()
@@ -279,6 +279,7 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
     direct_url = None
     published_scheme = TCP_ADDRESS_SCHEME if scheme == "tcp" and not rdp else scheme
     refresh_redirect_at = 0
+    last_revision = None
     default_port = 443 if scheme == "https" else 80
     with subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
@@ -319,12 +320,19 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
                         direct_url = f"{address}:{public_port}" if scheme == "tcp" else f"{scheme}://{address}{suffix}"
                         report(f"公网 TCP 映射 {address}:{public_port}。")
                         report(f"直连地址 {direct_url}")
-                        if scheme == "tcp":
-                            save_address(f"直连地址 {direct_url}")
-                        elif redirect:
+                        if redirect:
                             save_address(f"等待固定入口确认。\n直连地址 {direct_url}")
+                        elif scheme == "tcp":
+                            save_address(f"直连地址 {direct_url}")
 
-                if stop.is_set() or not redirect or mapping is None or time.monotonic() < refresh_redirect_at:
+                if stop.is_set() or not redirect or mapping is None:
+                    continue
+                if tcp_revision is not None:
+                    revision = tcp_revision()
+                    if revision != last_revision:
+                        last_revision = revision
+                        refresh_redirect_at = 0
+                if time.monotonic() < refresh_redirect_at:
                     continue
                 if scheme == "tcp" and (tcp_lookup_enabled is None or not tcp_lookup_enabled(rdp)):
                     continue
@@ -366,7 +374,7 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
 
 def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
                save_address=save_access_address, on_scheme=None, tcp_lookup_enabled=None,
-               publish_via_d1=None, tcp_group=None):
+               publish_via_d1=None, tcp_group=None, tcp_revision=None):
     stop = stop if stop is not None else Event()
     # Also detect a listener from an older launch that predates the lock.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -418,7 +426,7 @@ def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
             address_error = maintain_mapping(command, scheme, mapping_redirect, system_proxy=args.system_proxy,
                                              stop=stop, report=report, save_address=save_address,
                                              tcp_lookup_enabled=tcp_lookup_enabled, publish_via_d1=publish_via_d1,
-                                             rdp=rdp, tcp_group=tcp_group)
+                                             rdp=rdp, tcp_group=tcp_group, tcp_revision=tcp_revision)
             if stop.is_set():
                 break
             if track_address:

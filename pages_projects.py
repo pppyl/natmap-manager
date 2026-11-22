@@ -31,6 +31,7 @@ PROJECT_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?\Z")
 PAGES_HOST = re.compile(r"[a-z0-9-]+\.pages\.dev\Z")
 WEB_ACCESS_MODES = ("redirect", "proxy")
 MAPPING_LEASE_SECONDS = 180  # Keep this aligned with LEASE_MS in the Pages function.
+REMOTE_LOOKUP_VERSION = 13  # Keep this aligned with X-NATMap-Remote-Version.
 
 
 def powershell_path(path):
@@ -632,10 +633,10 @@ class PagesProjects:
         request = Request(f"{entry}/_natmap/remote", method="HEAD", headers={"User-Agent": "NATMap-Manager/1.0"})
         try:
             with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
-                return response.headers.get("X-NATMap-Remote-Version") == "12"
+                return response.headers.get("X-NATMap-Remote-Version") == str(REMOTE_LOOKUP_VERSION)
         except HTTPError as error:
             with error:
-                return error.code == 503 and error.headers.get("X-NATMap-Remote-Version") == "12"
+                return error.code == 503 and error.headers.get("X-NATMap-Remote-Version") == str(REMOTE_LOOKUP_VERSION)
         except (OSError, ValueError):
             return False
 

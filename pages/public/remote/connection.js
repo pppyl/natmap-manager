@@ -102,13 +102,19 @@ async function fetchDevices() {
 function showDevice(card, device) {
   card.querySelector("[data-device-name]").textContent = device.name;
   const state = card.querySelector("[data-device-state]");
-  state.textContent = device.address ? "已同步" : "离线";
-  state.dataset.state = device.address ? "available" : "offline";
+  const label = { available: "已同步", pending: "待同步", expired: "地址已过期", invalid: "等待 TCP 地址" };
+  state.dataset.state = device.address ? "available" : device.state || "pending";
+  state.textContent = label[state.dataset.state] || label.pending;
   card.querySelector("[data-device-address]").textContent = device.address
     ? (device.rdp ? `mstsc /v:${device.address}` : device.address) : "—";
   for (const button of card.querySelectorAll("button[data-action]")) {
-    button.disabled = !device.address;
+    button.disabled = !device.address || card.hasAttribute("data-working");
     button.hidden = button.dataset.action !== "copy-address" && !device.rdp;
+  }
+  const fallback = card.querySelector("[data-device-fallback]");
+  if (!fallback.hidden) {
+    if (device.address && device.rdp) fallback.querySelector("a").href = appUrl(device.address);
+    else fallback.hidden = true;
   }
 }
 
@@ -116,23 +122,50 @@ function bindDirectory(container) {
   const template = document.querySelector("#device-card");
   const refresh = document.querySelector("#refresh-devices");
   const downloads = document.querySelector("#device-app-downloads");
+  const cards = new Map();
+  let currentDevices = new Map();
+  let loading = null;
 
-  async function update() {
-    refresh.disabled = true;
-    try {
-      const devices = await fetchDevices();
-      downloads.hidden = !devices.some(device => device.rdp);
-      container.replaceChildren(...devices.map(device => {
-        const card = template.content.firstElementChild.cloneNode(true);
+  function render(devices) {
+    currentDevices = new Map(devices.map(device => [device.id, device]));
+    downloads.hidden = !devices.some(device => device.rdp);
+    for (const [index, device] of devices.entries()) {
+      let card = cards.get(device.id);
+      if (!card) {
+        card = template.content.firstElementChild.cloneNode(true);
         card.dataset.deviceId = device.id;
-        showDevice(card, device);
-        return card;
-      }));
-      statusText.textContent = devices.length ? "已获取实例连接地址。" : "暂无实例，请在管理页运行 TCP 项目。";
+        cards.set(device.id, card);
+      }
+      showDevice(card, device);
+      if (container.children[index] !== card) container.insertBefore(card, container.children[index] ?? null);
+    }
+    for (const [id, card] of cards) {
+      if (!currentDevices.has(id)) {
+        card.remove();
+        cards.delete(id);
+      }
+    }
+  }
+
+  function refreshDirectory() {
+    if (!loading) {
+      refresh.disabled = true;
+      loading = fetchDevices().then(render).finally(() => {
+        loading = null;
+        refresh.disabled = false;
+      });
+    }
+    return loading;
+  }
+
+  async function update(silent = false) {
+    try {
+      await refreshDirectory();
+      if (!silent) {
+        statusText.textContent = currentDevices.size ? "已获取实例连接地址。" : "暂无实例，请在管理页运行 TCP 项目。";
+      }
     } catch {
-      statusText.textContent = "暂时无法获取实例，请重试。";
-    } finally {
-      refresh.disabled = false;
+      if (!silent) statusText.textContent = "暂时无法获取实例，请重试。";
     }
   }
 
@@ -140,19 +173,20 @@ function bindDirectory(container) {
     const button = event.target.closest("button[data-action]");
     if (!button || button.disabled) return;
     const card = button.closest("[data-device-id]");
+    if (card.hasAttribute("data-working")) return;
     const fallback = card.querySelector("[data-device-fallback]");
     fallback.hidden = true;
+    card.setAttribute("data-working", "");
     button.disabled = true;
     try {
-      const device = (await fetchDevices()).find(item => item.id === card.dataset.deviceId);
+      await refreshDirectory();
+      const device = currentDevices.get(card.dataset.deviceId);
       if (!device) {
-        card.remove();
         statusText.textContent = "该实例已移出共享入口。";
         return;
       }
-      showDevice(card, device);
       if (!device.address) {
-        statusText.textContent = "该实例暂未同步或已离线。";
+        statusText.textContent = "该实例暂无有效的公网连接地址。";
         return;
       }
       if (button.dataset.action === "open-app" && device.rdp) {
@@ -163,12 +197,21 @@ function bindDirectory(container) {
         await copyText(device.address, "连接地址已复制。");
       }
     } catch {
-      button.disabled = false;
       statusText.textContent = "暂时无法获取连接地址，请重试。";
+    } finally {
+      card.removeAttribute("data-working");
+      const device = currentDevices.get(card.dataset.deviceId);
+      if (device) showDevice(card, device);
     }
   });
 
-  refresh.addEventListener("click", update);
+  function refreshIfVisible() {
+    if (!document.hidden) update(true);
+  }
+
+  refresh.addEventListener("click", () => update());
+  document.addEventListener("visibilitychange", refreshIfVisible);
+  window.setInterval(refreshIfVisible, 20000);
   update();
 }
 

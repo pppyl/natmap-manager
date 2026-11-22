@@ -25,7 +25,7 @@ from duckdns_natmap import (
     ADMIN_PORT, DEFAULT_NATMAP, DEFAULT_TARGET_HOST, MAPPING_SCHEMES, RDP_PORT, SETTINGS_FILE,
     RedirectUpdateError, normalize_target_host, port, run_locked_mapping, save_access_address, target_endpoint,
 )
-from pages_projects import CloudflareError, LOGIN_COMMAND, PAGES_HOST, PROJECT_NAME, WEB_ACCESS_MODES, PagesNameUnavailable, PagesProjects, WranglerLogin, cloudflare_request, discover_cloudflare_connections, normalize_proxy_origin, project_token
+from pages_projects import CloudflareError, LOGIN_COMMAND, PAGES_HOST, PROJECT_NAME, REMOTE_LOOKUP_VERSION, WEB_ACCESS_MODES, PagesNameUnavailable, PagesProjects, WranglerLogin, cloudflare_request, discover_cloudflare_connections, normalize_proxy_origin, project_token
 from platform_settings import AUTH_LABELS, PlatformProfile, PlatformSettings, pages_config, wrangler_login_status, write_json
 
 
@@ -94,6 +94,7 @@ class Project:
     tcp_lookup_ready: bool = False
     shared_entry: str = ""
     tcp_group_ready: bool = False
+    tcp_group_version: int = 0
 
     def __post_init__(self):
         if not PROJECT_NAME.fullmatch(self.slug):
@@ -158,6 +159,10 @@ class Project:
     @property
     def can_share_entry(self):
         return self.supports_remote_lookup and self.scheme == "tcp" and not self.shared_entry
+
+    @property
+    def tcp_group_current(self):
+        return self.tcp_group_ready and self.tcp_group_version == REMOTE_LOOKUP_VERSION
 
     def remote_link(self, *, rdp):
         ready = self.rdp_lookup_ready if rdp else self.tcp_lookup_ready
@@ -334,7 +339,8 @@ class Manager:
             if not anchor or not anchor.supports_remote_lookup:
                 return False
             group = bool(self.share_members(anchor.slug))
-            if anchor.remote_link(rdp=rdp) and (not group or anchor.tcp_group_ready):
+            link = anchor.remote_link(rdp=rdp)
+            if link and (not group or anchor.tcp_group_current):
                 return True
             lookup = self.remote_lookups.setdefault(anchor.slug, RemoteLookup())
             if lookup.thread is None and monotonic() >= lookup.retry_at:
@@ -342,7 +348,7 @@ class Manager:
                 lookup.thread = Thread(target=self.deploy_remote_lookup, args=(anchor.slug, lookup, rdp, group),
                                        name=f"natmap-remote-{anchor.slug}", daemon=True)
                 lookup.thread.start()
-            return False
+            return bool(link and group and anchor.tcp_group_ready)
 
     def deploy_remote_lookup(self, slug, lookup, rdp, group):
         try:
@@ -365,7 +371,7 @@ class Manager:
                 if not project.supports_remote_lookup:
                     raise ValueError("TCP 外网链接需要一个由管理页创建的 Pages 项目。")
                 link = project.remote_link(rdp=rdp)
-                if link and (not group or project.tcp_group_ready):
+                if link and (not group or project.tcp_group_current):
                     return link
                 platform = self.platforms.selected()
             PagesProjects(platform).deploy_remote_lookup(
@@ -376,7 +382,8 @@ class Manager:
                 if not current.supports_remote_lookup or (current.entry, current.owner) != (project.entry, project.owner):
                     raise ValueError("项目配置已变化，外网链接等待下次同步。")
                 updated = replace(current, rdp_lookup_ready=True, tcp_lookup_ready=True,
-                                  tcp_group_ready=current.tcp_group_ready or group)
+                                  tcp_group_ready=current.tcp_group_ready or group,
+                                  tcp_group_version=REMOTE_LOOKUP_VERSION)
                 self.store(updated)
                 return updated.remote_link(rdp=rdp)
 
@@ -733,6 +740,7 @@ class Manager:
                         tcp_lookup_enabled=(lambda rdp: self.prepare_remote_lookup(project, rdp)) if anchor.supports_remote_lookup else None,
                         publish_via_d1=publish_via_d1 if anchor.entry and anchor.owner else None,
                         tcp_group=(lambda: self.tcp_directory(project, anchor)) if anchor.supports_remote_lookup else None,
+                        tcp_revision=(lambda: self.directory_revision) if redirect and project.scheme == "tcp" else None,
                     )
             with self.lock:
                 if task.phase != "正在重启" or self.closing.is_set():

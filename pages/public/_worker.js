@@ -12,7 +12,7 @@ const REMOTE_HEADERS = {
   ...NO_CACHE,
   "Referrer-Policy": "no-referrer",
   "X-Robots-Tag": "noindex, nofollow",
-  "X-NATMap-Remote-Version": "12",
+  "X-NATMap-Remote-Version": "13",
 };
 const encoder = new TextEncoder();
 const WEB_PROXY_HEADERS = { "X-NATMap-Entry-Mode": "proxy" };
@@ -98,7 +98,8 @@ async function deviceList(env, project) {
   return readDirectory(mappings.get(`${project}/`), project).map(({ id, name }) => {
     const row = mappings.get(id === project ? project : `${project}/${id}`);
     const endpoint = tcpEndpoint(row?.location);
-    return { id, name, address: row?.expires_at > now ? endpoint?.address ?? "" : "", rdp: endpoint?.rdp ?? false };
+    const state = !row ? "pending" : !endpoint ? "invalid" : row.expires_at > now ? "available" : "expired";
+    return { id, name, address: state === "available" ? endpoint.address : "", rdp: endpoint?.rdp ?? false, state };
   });
 }
 

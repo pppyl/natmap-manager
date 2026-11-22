@@ -79,4 +79,5 @@ button:disabled { opacity: .48; cursor: default; }
 .device-heading h2 { min-width: 0; overflow-wrap: anywhere; }
 .device-state { color: var(--muted); font-size: .9rem; }
 .device-state[data-state="available"] { color: var(--accent); }
+.device-state[data-state="expired"], .device-state[data-state="invalid"] { color: #8c531a; }
 .device-fallback { margin-top: .6rem; }
