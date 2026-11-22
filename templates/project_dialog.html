@@ -33,29 +33,17 @@
           {{ create_issue('target_port') }}
         </label>
         <fieldset class="create-fields" data-manager-settings{% if not manager_target %} hidden disabled{% endif %}>
-          <label>HTTPS 回源域名
-            <input name="manager_origin" value="{{ values.manager_origin | default(values.proxy_origin | default('')) }}" placeholder="origin.example.com" {{ issue_attributes('manager_origin') }} required>
-            {{ create_issue('manager_origin') }}
-          </label>
-          <label>证书路径（PEM）
-            <input name="manager_certificate" value="{{ values.manager_certificate | default('') }}" placeholder="C:\certs\fullchain.pem" {{ issue_attributes('manager_certificate') }} required>
-            {{ create_issue('manager_certificate') }}
-          </label>
-          <label>私钥路径（PEM）
-            <input name="manager_private_key" value="{{ values.manager_private_key | default('') }}" placeholder="C:\certs\privkey.pem" {{ issue_attributes('manager_private_key') }} required>
-            {{ create_issue('manager_private_key') }}
-          </label>
           <label>远程管理密码
-            <input type="password" name="manager_password" autocomplete="new-password" minlength="12" {{ issue_attributes('manager_password') }} required>
+            <input type="password" name="manager_password" autocomplete="new-password" {{ issue_attributes('manager_password') }} required>
             {{ create_issue('manager_password') }}
           </label>
-          <label>固定入口方式
-            <select name="manager_web_mode" {{ issue_attributes('manager_web_mode') }}>{{ web_mode_options(values.web_mode | default('proxy')) }}</select>
-            {{ create_issue('manager_web_mode') }}
-          </label>
-          <p class="hint">远程使用 HTTPS，登录用户名为 natmap。</p>
+          <p class="hint">固定网址会跳转到当前 HTTP 直连地址。登录用户名为 natmap。</p>
         </fieldset>
-        <details class="advanced-settings"{% if (values.target_host and values.target_host != '127.0.0.1') or values.bind_port or values.scheme in ('http', 'https', 'tcp') or values.web_mode == 'proxy' or (issue and issue.field in ('target_host', 'bind_port', 'scheme', 'web_mode', 'proxy_origin')) %} open{% endif %}>
+        {% set advanced_service = not manager_target and (
+          (values.target_host and values.target_host != '127.0.0.1') or values.scheme in ('http', 'https', 'tcp')
+          or values.web_mode == 'proxy' or (issue and issue.field in ('target_host', 'scheme', 'web_mode', 'proxy_origin'))
+        ) %}
+        <details class="advanced-settings"{% if advanced_service or values.bind_port or (issue and issue.field == 'bind_port') %} open{% endif %}>
           <summary>高级设置</summary>
           <div class="advanced-fields">
             <fieldset class="create-fields" data-service-settings{% if manager_target %} hidden disabled{% endif %}>

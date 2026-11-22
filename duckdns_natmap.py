@@ -267,7 +267,7 @@ def read_natmap_output(stream, messages):
 
 def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None,
                      report=log_line, save_address=save_access_address, tcp_lookup_enabled=None,
-                     publish_via_d1=None, rdp=False, tcp_group=None, tcp_revision=None):
+                     publish_via_d1=None, rdp=False, tcp_group=None, tcp_revision=None, on_public_address=None):
     """Run one NATMap attempt and report whether the local address could not be reused."""
     messages = Queue()
     stop = stop if stop is not None else Event()
@@ -316,6 +316,8 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
                         mapping = received
                         refresh_redirect_at = 0
                         address, public_port = mapping
+                        if on_public_address is not None:
+                            on_public_address(address)
                         suffix = "" if public_port == default_port else f":{public_port}"
                         direct_url = f"{address}:{public_port}" if scheme == "tcp" else f"{scheme}://{address}{suffix}"
                         report(f"公网 TCP 映射 {address}:{public_port}。")
@@ -362,6 +364,8 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
                             report(note)
                         report(message)
         finally:
+            if on_public_address is not None:
+                on_public_address(None)
             if process.poll() is None:
                 try:
                     process.terminate()
@@ -374,7 +378,7 @@ def maintain_mapping(command, scheme, redirect, *, system_proxy=False, stop=None
 
 def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
                save_address=save_access_address, on_scheme=None, tcp_lookup_enabled=None,
-               publish_via_d1=None, tcp_group=None, tcp_revision=None):
+               publish_via_d1=None, tcp_group=None, tcp_revision=None, on_public_address=None):
     stop = stop if stop is not None else Event()
     # Also detect a listener from an older launch that predates the lock.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -426,7 +430,8 @@ def run_natmap(args, executable, redirect, *, stop=None, report=log_line,
             address_error = maintain_mapping(command, scheme, mapping_redirect, system_proxy=args.system_proxy,
                                              stop=stop, report=report, save_address=save_address,
                                              tcp_lookup_enabled=tcp_lookup_enabled, publish_via_d1=publish_via_d1,
-                                             rdp=rdp, tcp_group=tcp_group, tcp_revision=tcp_revision)
+                                             rdp=rdp, tcp_group=tcp_group, tcp_revision=tcp_revision,
+                                             on_public_address=on_public_address)
             if stop.is_set():
                 break
             if track_address:

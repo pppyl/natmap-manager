@@ -1,6 +1,6 @@
 {% extends "natmap_base.html" %}
 {% block content %}
-<main class="shell project-shell project-dashboard" data-project-dashboard>
+<main class="shell project-shell project-dashboard" data-project-dashboard data-dashboard-url="{{ url_for('index') }}">
   <div class="section-heading project-toolbar">
     <h2 id="projects-heading">项目</h2>
     <div class="actions">

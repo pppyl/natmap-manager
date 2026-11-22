@@ -31,11 +31,13 @@
             <label>项目名称<input name="name" value="{{ fields.name }}" maxlength="60" required></label>
             {% if project.manager_target %}
               <input type="hidden" name="target_port" value="{{ project.target_port }}">
-              <input type="hidden" name="scheme" value="https">
+              <input type="hidden" name="scheme" value="{{ project.scheme }}">
+              {% if project.scheme == 'https' %}
               <label>HTTPS 回源域名<input value="{{ project.proxy_origin }}" readonly></label>
               <label>更换证书路径（PEM）<input name="manager_certificate" placeholder="留空保留证书路径"></label>
               <label>更换私钥路径（PEM）<input name="manager_private_key" placeholder="留空保留私钥路径"></label>
-              <label>更改远程管理密码<input type="password" name="manager_password" autocomplete="new-password" minlength="12" placeholder="留空保留密码"></label>
+              {% endif %}
+              <label>更改远程管理密码<input type="password" name="manager_password" autocomplete="new-password" placeholder="留空保留密码"></label>
             {% else %}
             <label>服务监听地址{{ target_host_input(fields.target_host if fields.target_host is not none else project.target_host) }}</label>
             <label>服务端口<input type="number" name="target_port" min="1" max="65535" value="{{ fields.target_port }}" required></label>
@@ -63,6 +65,9 @@
         {% if project.own_entry %}
           <section class="project-more" data-web-access{% if project.tcp %} hidden{% endif %}>
             <h3>网页固定入口</h3>
+            {% if project.manager_target and project.scheme == 'http' %}
+            <p class="hint">302 跳转到当前 HTTP 直连地址。</p>
+            {% else %}
             <form method="post" action="{{ url_for('set_web_access') }}" data-web-access-form>
               <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="slug" value="{{ project.slug }}">
               <fieldset class="create-fields">
@@ -76,12 +81,13 @@
                 <button type="submit" class="secondary">应用入口方式</button>
               </fieldset>
             </form>
+            {% endif %}
           </section>
         {% endif %}
 
         <section class="project-more" aria-labelledby="manage-logs-{{ project.slug }}">
           <h3 id="manage-logs-{{ project.slug }}">运行日志</h3>
-          {% if project.entry and project.entry != ('https://' ~ project.slug ~ '.pages.dev') %}
+          {% if project.own_entry and project.own_entry != ('https://' ~ project.slug ~ '.pages.dev') %}
             <p class="hint project-detail">申请的子域名为 {{ project.slug }}.pages.dev</p>
           {% endif %}
           <p class="configuration-note" data-changes-pending role="status"{% if not project.changes_pending or project.phase == '正在重启' %} hidden{% endif %}>本地地址、端口或协议将在下次运行时生效。</p>

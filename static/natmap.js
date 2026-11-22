@@ -19,6 +19,25 @@ let customProjectOrder = [];
 let projectSortMode = sortSelect?.value || "custom";
 let editingProjectOrder = false;
 let savingProjectOrder = false;
+let csrfRefresh = null;
+
+async function postProjectForm(url, body, { redirect = "follow" } = {}) {
+  const options = { method: "POST", headers: { Accept: "application/json" }, body, redirect };
+  const response = await fetch(url, options);
+  if (response.status !== 403 || response.headers.get("X-NATMap-CSRF") !== "expired") return response;
+
+  if (!csrfRefresh) {
+    csrfRefresh = fetch("/csrf", { cache: "no-store", credentials: "same-origin" }).then(async result => {
+      if (!result.ok) throw new Error("无法更新页面会话，请刷新后重试。");
+      const { csrf } = await result.json();
+      if (typeof csrf !== "string" || !csrf) throw new Error("无法更新页面会话，请刷新后重试。");
+      for (const field of document.querySelectorAll('input[type="hidden"][name="csrf"]')) field.value = csrf;
+      return csrf;
+    }).finally(() => { csrfRefresh = null; });
+  }
+  body.set("csrf", await csrfRefresh);
+  return fetch(url, options);
+}
 
 async function copyAddress(value) {
   try {
@@ -265,9 +284,7 @@ async function saveProjectEditor(event) {
   error.hidden = true;
   const body = new FormData(form);
   try {
-    const response = await fetch(form.action, {
-      method: "POST", headers: { Accept: "application/json" }, body,
-    });
+    const response = await postProjectForm(form.action, body);
     const result = await response.json();
     if (!response.ok) {
       error.textContent = result.message || "配置未保存，请重试。";
@@ -306,6 +323,39 @@ function showProjectNotice(message) {
   editNoticeTimer = window.setTimeout(() => { notice.hidden = true; }, 5000);
 }
 
+async function submitMappingAction(event) {
+  const form = event.target;
+  const button = event.submitter;
+  if (!form.matches(".project-actions, [data-batch-actions]") || !button) return;
+  event.preventDefault();
+  if (form.hasAttribute("data-submitting")) return;
+  const action = button.getAttribute("formaction") || form.action;
+  const body = new FormData(form, button);
+  form.setAttribute("data-submitting", "");
+  button.disabled = true;
+  let navigating = false;
+  try {
+    // Keep Flask's flash messages for the dashboard navigation, not the fetch.
+    const response = await postProjectForm(action, body, { redirect: "manual" });
+    if (response.type === "opaqueredirect") {
+      window.location.assign(dashboard.dataset.dashboardUrl);
+      navigating = true;
+      return;
+    }
+    const result = await response.json().catch(() => null);
+    showProjectNotice(result?.message || "未能确认操作结果，请查看项目状态。");
+  } catch (error) {
+    showProjectNotice(error.message || "未能确认操作结果，请查看项目状态。");
+  } finally {
+    if (!navigating) {
+      form.removeAttribute("data-submitting");
+      button.disabled = false;
+    }
+  }
+}
+
+dashboard?.addEventListener("submit", submitMappingAction);
+
 function syncProxyOrigin(form) {
   const field = form.querySelector("[data-proxy-origin]");
   if (field) field.hidden = form.elements.namedItem("web_mode").value !== "proxy";
@@ -324,7 +374,7 @@ async function saveWebAccess(event) {
   button.textContent = "正在更新 Pages…";
   error.hidden = true;
   try {
-    const response = await fetch(form.action, { method: "POST", body });
+    const response = await postProjectForm(form.action, body);
     const result = await response.json();
     if (!response.ok) throw new Error(result.message);
     showProjectNotice(result.message);
@@ -399,7 +449,7 @@ async function saveProjectOrder(mode, order) {
   const body = new URLSearchParams({ csrf: sortForm.elements.namedItem("csrf").value, mode });
   order?.forEach(slug => body.append("order", slug));
   try {
-    const response = await fetch(sortForm.action, { method: "POST", body });
+    const response = await postProjectForm(sortForm.action, body);
     const result = await response.json();
     if (!response.ok) throw new Error(result.message || "无法保存排序，请重试。");
     projectSortMode = result.mode;
@@ -603,11 +653,7 @@ if (createDialog) {
     submittingProject = true;
     setCreatePending(true);
     try {
-      const response = await fetch(createForm.action, {
-        method: "POST",
-        headers: { Accept: "application/json" },
-        body,
-      });
+      const response = await postProjectForm(createForm.action, body);
       const result = await response.json();
       if (response.ok && result.draft) {
         setDraftSlug(result.draft);
@@ -667,10 +713,7 @@ async function updateCreateForm(projects) {
     const targetKind = createForm.elements.namedItem("target_kind");
     if (targetKind) {
       targetKind.value = "service";
-      createForm.elements.namedItem("manager_web_mode").value = "proxy";
-      for (const name of ["manager_origin", "manager_certificate", "manager_private_key", "manager_password"]) {
-        createForm.elements.namedItem(name).value = "";
-      }
+      createForm.elements.namedItem("manager_password").value = "";
     }
     const webMode = createForm.elements.namedItem("web_mode");
     if (webMode) {
