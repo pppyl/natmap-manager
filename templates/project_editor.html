@@ -32,11 +32,6 @@
             {% if project.manager_target %}
               <input type="hidden" name="target_port" value="{{ project.target_port }}">
               <input type="hidden" name="scheme" value="{{ project.scheme }}">
-              {% if project.scheme == 'https' %}
-              <label>HTTPS 回源域名<input value="{{ project.proxy_origin }}" readonly></label>
-              <label>更换证书路径（PEM）<input name="manager_certificate" placeholder="留空保留证书路径"></label>
-              <label>更换私钥路径（PEM）<input name="manager_private_key" placeholder="留空保留私钥路径"></label>
-              {% endif %}
               <label>登录用户名<input name="manager_username" value="{{ fields.manager_username if fields.manager_username is not none else project.manager_username }}" autocomplete="username" spellcheck="false" required></label>
               <label>更改远程管理密码<input type="password" name="manager_password" autocomplete="new-password" placeholder="留空保留密码"></label>
             {% else %}
@@ -49,6 +44,17 @@
             {% endif %}
             <label>NATMap 本地端口（选填）<input type="number" name="bind_port" min="1" max="65535" value="{{ fields.bind_port if fields.bind_port is not none else '' }}" placeholder="留空自动分配"></label>
           </div>
+          {% if project.manager_target %}
+            <details class="advanced-settings"{% if edit_open %} open{% endif %}>
+              <summary>HTTPS 设置（选填）</summary>
+              <div class="advanced-fields">
+                <p class="hint">三项填齐后使用 HTTPS。清空三项并保存可切换到 HTTP。</p>
+                <label>HTTPS 回源域名<input name="manager_origin" value="{{ fields.manager_origin if edit_open and fields.manager_origin is not none else project.proxy_origin }}" maxlength="253" placeholder="origin.example.com" spellcheck="false"></label>
+                <label>证书路径（PEM）<input name="manager_certificate" value="{{ fields.manager_certificate }}"></label>
+                <label>私钥路径（PEM）<input name="manager_private_key" value="{{ fields.manager_private_key }}"></label>
+              </div>
+            </details>
+          {% endif %}
           <p class="form-error" data-edit-error role="alert"{% if not edit_open %} hidden{% endif %}>{{ edit_issue.message if edit_open else '' }}</p>
           <button type="submit" class="primary">保存配置</button>
         </form>

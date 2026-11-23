@@ -75,6 +75,25 @@ def remote_manager_tls(project):
     return context
 
 
+def manager_origin_settings(origin, certificate, private_key):
+    fields = (
+        ("manager_origin", origin, "HTTPS 回源域名"),
+        ("manager_certificate", certificate, "PEM 证书路径"),
+        ("manager_private_key", private_key, "PEM 私钥路径"),
+    )
+    https = any(value for _, value, _ in fields)
+    if https:
+        for name, value, label in fields:
+            if not value:
+                raise ProjectInputError(name, f"使用 HTTPS 时请填写{label}。使用 HTTP 可将三项全部留空。")
+    return {
+        "scheme": "https" if https else "http",
+        "proxy_origin": origin,
+        "manager_certificate": certificate,
+        "manager_private_key": private_key,
+    }
+
+
 @contextmanager
 def serve_management_in_thread(server, *, name):
     thread = Thread(target=server.serve_forever, name=name, daemon=True)
@@ -420,6 +439,8 @@ class Manager:
         with self.provision_lock:
             with self.lock:
                 project = self.project(slug)
+                if slug in self.web_access_updates:
+                    raise ValueError("这个项目正在更新固定入口，请稍候。")
                 task = self.tasks.get(slug)
                 detected = task.detected_scheme if task and self.active(slug) else ""
                 if not project.entry or project.scheme == "tcp" or detected in ("tcp", "rdp"):
@@ -561,7 +582,8 @@ class Manager:
             self.remote_lookups.pop(slug, None)
 
     def edit(self, slug, name, target_port, bind_port, scheme, target_host=None,
-             *, manager_username=None, manager_password="", manager_certificate="", manager_private_key="", shared_entry=None):
+             *, manager_username=None, manager_password="", manager_origin=None,
+             manager_certificate="", manager_private_key="", shared_entry=None):
         with self.lock:
             project = self.project(slug)
             if slug in self.web_access_updates:
@@ -569,14 +591,18 @@ class Manager:
             if not project.ready:
                 raise ValueError("请在新建项目表单中修改未完成的项目。")
             if project.manager_target:
+                if manager_origin is None:
+                    manager_origin = project.proxy_origin
+                    manager_certificate = manager_certificate or project.manager_certificate
+                    manager_private_key = manager_private_key or project.manager_private_key
+                transport = manager_origin_settings(manager_origin, manager_certificate, manager_private_key)
                 updated = replace(
-                    project, name=name, bind_port=bind_port,
+                    project, name=name, bind_port=bind_port, **transport,
+                    web_mode=project.web_mode if transport["scheme"] == "https" else "redirect",
                     manager_username=project.manager_username if manager_username is None else manager_username,
                     manager_password_hash=(remote_manager_password_hash(manager_password) if manager_password else project.manager_password_hash),
                 )
-                if project.manager_https:
-                    updated = replace(updated, manager_certificate=manager_certificate or project.manager_certificate,
-                                      manager_private_key=manager_private_key or project.manager_private_key)
+                if updated.manager_https:
                     remote_manager_tls(updated)
             else:
                 updated = replace(project, name=name, target_port=target_port, bind_port=bind_port, scheme=scheme,
@@ -585,15 +611,49 @@ class Manager:
             self.validate_shared_entry(updated)
             if not updated.ready:
                 raise ValueError("网页协议需要 Pages 入口。请新建一个网页项目。")
-            task = self.tasks.get(slug)
-            restart = self.active(slug) and task.phase in ("运行中", "正在重启") and not self.closing.is_set()
-            if restart:
+            if not updated.manager_target or (updated.manager_https, updated.proxy_origin) == (
+                project.manager_https, project.proxy_origin,
+            ):
+                return self._save_project_edit(updated)
+            if self.closing.is_set():
+                raise ValueError("管理页正在退出。")
+            if self.active(slug):
                 self.check_mapping_ports(updated)
-            self.store(updated)
-            if restart:
-                task.phase = "正在重启"
-                task.stop.set()
-            return restart
+            pages = PagesProjects(self.platforms.selected())
+            self.web_access_updates.add(slug)
+
+        def sync_entry(settings):
+            pages.set_web_access(
+                slug, settings.entry, settings.owner, settings.web_mode, settings.proxy_origin,
+                https_only=settings.manager_https,
+            )
+
+        try:
+            with self.provision_lock:
+                sync_entry(updated)
+                try:
+                    with self.lock:
+                        return self._save_project_edit(replace(updated, note=self.project(slug).note))
+                except (OSError, ValueError):
+                    try:
+                        sync_entry(project)
+                    except (CloudflareError, OSError, ValueError) as error:
+                        raise CloudflareError("本机配置未更新，固定入口恢复暂未确认，请重新保存配置。") from error
+                    raise
+        finally:
+            with self.lock:
+                self.web_access_updates.discard(slug)
+
+    def _save_project_edit(self, updated):
+        task = self.tasks.get(updated.slug)
+        restart = self.active(updated.slug) and task.phase in ("运行中", "正在重启") and not self.closing.is_set()
+        if restart:
+            self.check_mapping_ports(updated)
+        self.store(updated)
+        if restart:
+            task.phase = "正在重启"
+            task.stop.set()
+        return restart
 
     def check_mapping_ports(self, project):
         used = {ADMIN_PORT}
@@ -632,6 +692,8 @@ class Manager:
             if self.closing.is_set():
                 raise ValueError("管理页正在退出。")
             project = self.project(slug)
+            if slug in self.web_access_updates:
+                raise ValueError("这个项目正在更新固定入口，请稍候。")
             if self.active(slug):
                 raise ValueError("该任务正在运行，请稍候。")
             if action == "provision" and (project.ready or not project.owner):
@@ -823,7 +885,7 @@ class Manager:
                 task.stop.set()
             return len(running)
 
-    def snapshot(self):
+    def snapshot(self, *, include_certificate_paths=False):
         with self.lock:
             rows = []
             for project in self.projects.values():
@@ -884,6 +946,8 @@ class Manager:
                              "phase": task.phase if task else ("待运行" if project.ready else "待创建"),
                              "detail": task.detail if task else "", "error_field": task.error_field if task else "",
                              "logs": "\n".join(task.logs) if task else ""})
+                if include_certificate_paths and project.manager_target:
+                    rows[-1].update(manager_certificate=project.manager_certificate, manager_private_key=project.manager_private_key)
             return rows
 
     def close(self):
@@ -938,7 +1002,7 @@ def create_app(manager, *, remote_project=None, remote_http=False):
         return session["csrf"]
 
     def render_dashboard(edit_issue=None, *, open_create=False, draft_slug=None, values=None, issue=None):
-        rows = manager.snapshot()
+        rows = manager.snapshot(include_certificate_paths=True)
         projects = [row for row in rows if row["ready"]]
         drafts = [row for row in rows if not row["ready"]]
         draft = next((row for row in drafts if row["slug"] == draft_slug), None)
@@ -1060,6 +1124,8 @@ def create_app(manager, *, remote_project=None, remote_http=False):
         values = {key: request.form.get(key, "") for key in ("name", "slug", "target_port", "bind_port")}
         values["target_kind"] = request.form.get("target_kind", "service")
         values["manager_username"] = request.form.get("manager_username", REMOTE_MANAGER_USER)
+        for name in ("manager_origin", "manager_certificate", "manager_private_key"):
+            values[name] = request.form.get(name, "").strip()
         values["shared_entry"] = request.form.get("shared_entry", "").strip().lower()
         values["target_host"] = request.form.get("target_host", DEFAULT_TARGET_HOST)
         values["scheme"] = request.form.get("scheme", "auto")
@@ -1071,12 +1137,17 @@ def create_app(manager, *, remote_project=None, remote_http=False):
                 raise ProjectInputError("target_kind", "请选择要转发的服务。")
             manager_options = {}
             if values["target_kind"] == "manager":
-                values.update(target_host=DEFAULT_TARGET_HOST, target_port=str(ADMIN_PORT), scheme="http",
-                              web_mode="redirect", proxy_origin="", shared_entry="")
+                transport = manager_origin_settings(
+                    values["manager_origin"], values["manager_certificate"], values["manager_private_key"],
+                )
+                values.update(target_host=DEFAULT_TARGET_HOST, target_port=str(ADMIN_PORT), web_mode="redirect",
+                              shared_entry="", scheme=transport["scheme"], proxy_origin=transport["proxy_origin"])
                 manager_options = {
                     "manager_target": True,
                     "manager_username": values["manager_username"],
                     "manager_password_hash": remote_manager_password_hash(request.form.get("manager_password", "")),
+                    "manager_certificate": transport["manager_certificate"],
+                    "manager_private_key": transport["manager_private_key"],
                 }
             slug = values["slug"].strip().lower()
             local_only = values["scheme"] == "tcp" and (bool(values["shared_entry"]) or not slug)
@@ -1084,9 +1155,13 @@ def create_app(manager, *, remote_project=None, remote_http=False):
                 slug = f"tcp-{token_hex(8)}"
             project = Project(slug, **project_settings(values), web_mode=values["web_mode"],
                               proxy_origin=values["proxy_origin"], shared_entry=values["shared_entry"], **manager_options)
+            if project.manager_https:
+                remote_manager_tls(project)
             manager.create(project, previous, local_only=local_only)
         except ValueError as error:
             field = getattr(error, "field", "form")
+            if field == "proxy_origin" and values["target_kind"] == "manager":
+                field = "manager_origin"
             issue = {"field": field, "message": str(error)}
             if wants_json:
                 return jsonify(issue), 422
@@ -1106,6 +1181,10 @@ def create_app(manager, *, remote_project=None, remote_http=False):
         slug = request.form.get("slug", "").strip().lower()
         values = {key: request.form.get(key, "") for key in ("name", "target_port", "bind_port")}
         values["manager_username"] = request.form.get("manager_username")
+        submitted_origin = request.form.get("manager_origin")
+        values["manager_origin"] = submitted_origin.strip() if submitted_origin is not None else None
+        for name in ("manager_certificate", "manager_private_key"):
+            values[name] = request.form.get(name, "").strip()
         values["target_host"] = request.form.get("target_host")
         values["scheme"] = request.form.get("scheme", "http")
         share = request.form.get("shared_entry") if values["scheme"] == "tcp" else ""
@@ -1113,12 +1192,11 @@ def create_app(manager, *, remote_project=None, remote_http=False):
         try:
             restarting = manager.edit(
                 slug, **project_settings(values), manager_username=values["manager_username"],
-                manager_password=request.form.get("manager_password", ""),
-                manager_certificate=request.form.get("manager_certificate", "").strip(),
-                manager_private_key=request.form.get("manager_private_key", "").strip(),
+                manager_password=request.form.get("manager_password", ""), manager_origin=values["manager_origin"],
+                manager_certificate=values["manager_certificate"], manager_private_key=values["manager_private_key"],
                 shared_entry=values["shared_entry"],
             )
-        except ValueError as error:
+        except (ValueError, CloudflareError) as error:
             if wants_json:
                 return jsonify(message=str(error)), 422
             edit_issue = {"slug": slug, "fields": values, "message": str(error)}

@@ -283,6 +283,10 @@ async function saveProjectEditor(event) {
   const error = form.querySelector("[data-edit-error]");
   error.hidden = true;
   const body = new FormData(form);
+  const origin = form.elements.namedItem("manager_origin");
+  const updatingEntry = origin && origin.value.trim() !== origin.defaultValue.trim();
+  const submitLabel = submit.textContent;
+  if (updatingEntry) submit.textContent = "正在更新固定入口…";
   try {
     const response = await postProjectForm(form.action, body);
     const result = await response.json();
@@ -296,6 +300,10 @@ async function saveProjectEditor(event) {
     if (note) {
       if (note.value === body.get("note")) note.value = result.note;
       showProjectNotice(result.message);
+      return;
+    }
+    if (updatingEntry) {
+      window.location.reload();
       return;
     }
     const project = projectsBySlug.get(form.elements.namedItem("slug").value);
@@ -314,6 +322,7 @@ async function saveProjectEditor(event) {
     error.hidden = false;
   } finally {
     submit.disabled = false;
+    submit.textContent = submitLabel;
   }
 }
 
@@ -613,6 +622,9 @@ function syncCreateProtocol() {
   if (managerFields) {
     managerFields.hidden = !manager;
     managerFields.disabled = !manager;
+    const managerHttps = createForm.querySelector("[data-manager-https]");
+    managerHttps.hidden = !manager;
+    managerHttps.disabled = !manager;
     const serviceFields = createForm.querySelector("[data-service-settings]");
     serviceFields.hidden = manager;
     serviceFields.disabled = manager;
@@ -718,6 +730,7 @@ async function updateCreateForm(projects) {
       const managerUsername = createForm.elements.namedItem("manager_username");
       managerUsername.value = managerUsername.dataset.defaultValue;
       createForm.elements.namedItem("manager_password").value = "";
+      for (const field of createForm.querySelectorAll("[data-manager-https] input")) field.value = "";
     }
     const webMode = createForm.elements.namedItem("web_mode");
     if (webMode) {

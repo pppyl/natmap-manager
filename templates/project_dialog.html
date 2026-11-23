@@ -41,15 +41,33 @@
             <input type="password" name="manager_password" autocomplete="new-password" {{ issue_attributes('manager_password') }} required>
             {{ create_issue('manager_password') }}
           </label>
-          <p class="hint">固定网址会跳转到当前 HTTP 直连地址。</p>
+          <p class="hint">默认使用 HTTP 直连。</p>
         </fieldset>
         {% set advanced_service = not manager_target and (
           (values.target_host and values.target_host != '127.0.0.1') or values.scheme in ('http', 'https', 'tcp')
           or values.web_mode == 'proxy' or (issue and issue.field in ('target_host', 'scheme', 'web_mode', 'proxy_origin'))
         ) %}
-        <details class="advanced-settings"{% if advanced_service or values.bind_port or (issue and issue.field == 'bind_port') %} open{% endif %}>
+        {% set advanced_manager = manager_target and (values.manager_origin or values.proxy_origin
+          or values.manager_certificate or values.manager_private_key
+          or (issue and issue.field in ('manager_origin', 'manager_certificate', 'manager_private_key'))) %}
+        <details class="advanced-settings"{% if advanced_service or advanced_manager or values.bind_port or (issue and issue.field == 'bind_port') %} open{% endif %}>
           <summary>高级设置</summary>
           <div class="advanced-fields">
+            <fieldset class="create-fields" data-manager-https{% if not manager_target %} hidden disabled{% endif %}>
+              <p class="hint">以下三项可全部留空。使用 HTTPS 时请一起填写。</p>
+              <label>HTTPS 回源域名
+                <input name="manager_origin" value="{{ values.manager_origin | default(values.proxy_origin | default('')) }}" placeholder="origin.example.com" maxlength="253" spellcheck="false" {{ issue_attributes('manager_origin') }}>
+                {{ create_issue('manager_origin') }}
+              </label>
+              <label>证书路径（PEM）
+                <input name="manager_certificate" value="{{ values.manager_certificate | default('') }}" {{ issue_attributes('manager_certificate') }}>
+                {{ create_issue('manager_certificate') }}
+              </label>
+              <label>私钥路径（PEM）
+                <input name="manager_private_key" value="{{ values.manager_private_key | default('') }}" {{ issue_attributes('manager_private_key') }}>
+                {{ create_issue('manager_private_key') }}
+              </label>
+            </fieldset>
             <fieldset class="create-fields" data-service-settings{% if manager_target %} hidden disabled{% endif %}>
             <label>服务监听地址
               {{ target_host_input(values.target_host | default('127.0.0.1'), issue_attributes('target_host')) }}
